@@ -2,7 +2,6 @@
 
 import asyncio
 import struct
-import sys
 import uuid
 from collections.abc import AsyncGenerator
 from datetime import datetime
@@ -22,14 +21,6 @@ from app.streams.OfflineVideoSession import (
 )
 from app.streams.VideoStream import VideoStream
 from tests.conftest import FIXTURES_DIR
-
-
-@pytest.fixture(scope='session')
-def event_loop_policy() -> asyncio.AbstractEventLoopPolicy:
-    """Windows でも本番と同じく、子プロセスを利用できるイベントループを使う。"""
-    if sys.platform == 'win32':
-        return asyncio.WindowsProactorEventLoopPolicy()
-    return asyncio.get_event_loop_policy()
 
 
 @pytest.fixture(params=['terrestrial-bdav-partial-ts.m2ts'], ids=['M2TS'])
@@ -200,6 +191,13 @@ async def test_offline_video_session_legacy_stream(
     assert response.status_code == 200
     segments, count = ReadSegments(response.content)
     assert len(segments) == count == 1
+
+    playlist = await client.get(f'/api/streams/video/{video_id}/240p/playlist?session_id={uuid.uuid4().hex}')
+    assert playlist.status_code == 200
+    segment_url = next(line for line in playlist.text.splitlines() if line.startswith('segment?'))
+    segment = await client.get(f'/api/streams/video/{video_id}/240p/{segment_url}')
+    assert segment.status_code == 200
+    assert segment.content.startswith(b'\x47')
 
 
 @pytest.mark.asyncio

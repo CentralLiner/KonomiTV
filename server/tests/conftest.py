@@ -1,6 +1,8 @@
 
+import asyncio
 import json
 import shutil
+import sys
 import tempfile
 from collections.abc import AsyncGenerator
 from pathlib import Path
@@ -55,6 +57,10 @@ def pytest_configure(config: pytest.Config) -> None:
     Args:
         config (pytest.Config): pytest の設定
     """
+
+    # Windows では本番と同じく、子プロセスを利用できるイベントループを使う。
+    if sys.platform == 'win32':
+        asyncio.set_event_loop_policy(asyncio.WindowsProactorEventLoopPolicy())
 
     # 書き込みが発生するファイルとフォルダが、テスト用の名前に切り替わっていることを確かめる
     ## pyproject.toml の [tool.pytest_env] で KONOMITV_TEST が設定されていなければ、実際に使っている DB や設定を書き換えてしまう
