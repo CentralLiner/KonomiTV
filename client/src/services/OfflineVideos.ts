@@ -39,6 +39,31 @@ interface IOfflineVideoStreamMetadata {
     duration_seconds: number;
 }
 
+interface IOfflineVideoSessionInfo extends IOfflineVideoStreamMetadata {
+    protocol_version: 2;
+    generation_token: string;
+    lease_timeout_seconds: number;
+    max_segment_bytes: number;
+}
+
+interface IOfflineVideoConnection {
+    sessionID: string;
+    info: IOfflineVideoSessionInfo;
+    controller: AbortController;
+}
+
+interface IOfflineDownloadProgress {
+    segmentDurations: number[];
+    sizeBytes: number;
+}
+
+/** fetch() やストリームの読み取りで発生し、同じ保存を再接続できるエラー */
+class OfflineDownloadNetworkError extends Error {
+    constructor(message: string, readonly retryAfterMilliseconds = 0, readonly status?: number) {
+        super(message);
+    }
+}
+
 /**
  * 録画番組のオフライン保存ジョブとダウンロード応答の展開を管理する。
  */
@@ -107,7 +132,13 @@ export default class OfflineVideos {
     private static readonly JOB_PROGRESS_SIZE_MARGIN = 1.05;
 
     private static readonly STREAM_MAGIC = new TextEncoder().encode('KTVODLP\n');
-    private static foregroundAbortControllers = new Map<string, AbortController>();
+    private static readonly MAX_SEGMENT_BYTES = 32 * 1024 * 1024;
+    private static readonly RECONNECT_DELAYS = [1000, 2000, 4000, 8000, 15000];
+    private static readonly RECONNECT_BUDGET = 45_000;
+    private static jobAbortControllers = new Map<string, AbortController>();
+    private static reconnectingJobs = new Set<string>();
+    private static readonly cancellationChannel = typeof window !== 'undefined' && 'BroadcastChannel' in window
+        ? new BroadcastChannel('konomitv-offline-cancellation') : null;
     private static foregroundLockReleases = new Map<string, () => void>();
     /** Web Locks 非対応環境で、同一タブ内の start() 呼び出しを録画番組 ID ごとに直列化する */
     private static startMutexTailByVideoID = new Map<number, Promise<void>>();
@@ -117,6 +148,15 @@ export default class OfflineVideos {
         event.preventDefault();
         event.returnValue = '';
     };
+
+    static {
+        this.cancellationChannel?.addEventListener('message', (event: MessageEvent<unknown>) => {
+            if (typeof event.data === 'string') {
+                this.jobAbortControllers.get(event.data)?.abort();
+                this.notifyChange();
+            }
+        });
+    }
 
     /**
      * Background Fetch を利用できるかを返す。
@@ -156,6 +196,10 @@ export default class OfflineVideos {
     static async getJobs(): Promise<IOfflineDownloadJob[]> {
 
         return await OfflineVideoStorage.getJobs();
+    }
+
+    static isReconnecting(jobID: string): boolean {
+        return this.reconnectingJobs.has(jobID);
     }
 
     /**
@@ -213,7 +257,12 @@ export default class OfflineVideos {
      * @param useBackgroundFetch ダイアログでバックグラウンド保存が選ばれたか (未対応環境では前景 Fetch を使う)
      * @returns 作成した保存ジョブ
      */
-    static async start(program: IRecordedProgram, quality: string, useBackgroundFetch: boolean = false): Promise<IOfflineDownloadJob> {
+    static async start(
+        program: IRecordedProgram,
+        quality: string,
+        useBackgroundFetch: boolean = false,
+        retryJobID?: string,
+    ): Promise<IOfflineDownloadJob> {
 
         // Vue コンポーネントから渡される番組情報はリアクティブ Proxy のため、そのままでは IndexedDB の構造化複製に失敗する
         // API 由来の JSON データだけを保存時点のスナップショットへ変換し、Service Worker からも安全に読み出せる値へ固定する
@@ -239,6 +288,9 @@ export default class OfflineVideos {
             // ダイアログのスイッチがオンで、かつ Background Fetch API が使えるときだけバックグラウンド保存する
             // オフや未対応環境ではページ内 Fetch で保存し、複数本の同時ダウンロードを優先する
             const shouldUseBackgroundFetch = useBackgroundFetch === true && await this.isBackgroundFetchSupported() === true;
+            if (retryJobID !== undefined && useBackgroundFetch && !shouldUseBackgroundFetch) {
+                throw new Error('このブラウザではバックグラウンド保存を利用できません。');
+            }
 
             // Background Fetch は一時応答と展開後キャッシュが併存するため、前景保存の2倍を空き容量判定へ使う
             const storageEstimate = await navigator.storage?.estimate() ?? {};
@@ -263,179 +315,562 @@ export default class OfflineVideos {
                 background_fetch_id: shouldUseBackgroundFetch === true ? `konomitv-offline-${jobID}` : null,
                 error: null,
             };
-            const releaseForegroundLock = shouldUseBackgroundFetch === false ? await this.acquireForegroundLock(job.job_id) : null;
+            const controller = new AbortController();
+            this.jobAbortControllers.set(jobID, controller);
+            let releaseForegroundLock: (() => void) | null = null;
+            let isRegistered = false;
+            let isHandedOff = false;
             try {
-                await OfflineVideoStorage.putJobIfVideoIdle(job);
-            } catch (error) {
-                releaseForegroundLock?.();
-                throw error;
-            }
-
-            let request: Request;
-            try {
-                // オフライン保存 API は認証不要なので、ページ終了後もブラウザが単独で取得できる通常の Request を作成する
-                request = new Request(`${Utils.api_base_url}/streams/video/${programSnapshot.id}/${quality}/offline-stream`);
-
-                // 番組一覧とシークバーが通信なしでも描画できるよう、小さな付随データは動画本体より先に同じ世代へ保存する
-                const cache = await OfflineVideoStorage.openCache();
-                const generationBaseURL = OfflineVideoStorage.getGenerationBaseURL(programSnapshot.id, generationID);
-                const assetRequests = [
-                    {source: Videos.getThumbnailURL(programSnapshot), destination: `${generationBaseURL}/assets/thumbnail.webp`},
-                    {source: `${Utils.api_base_url}/videos/${programSnapshot.id}/thumbnail/tiled`, destination: `${generationBaseURL}/assets/thumbnail-tiled.webp`},
-                ];
-                if (programSnapshot.channel !== null) {
-                    assetRequests.push({
-                        source: `${Utils.api_base_url}/channels/${programSnapshot.channel.id}/logo`,
-                        destination: `${generationBaseURL}/assets/channel-logo`,
-                    });
+                if (!shouldUseBackgroundFetch) {
+                    releaseForegroundLock = await this.acquireForegroundLock(jobID);
                 }
-                await Promise.all(assetRequests.map(async assetRequest => {
-                    try {
-                        const assetResponse = await fetch(assetRequest.source);
-                        if (assetResponse.ok === true) {
-                            await cache.put(assetRequest.destination, assetResponse);
-                        }
-                    } catch (error) {
-                        // 付随データの取得失敗は動画保存を止めず、映像本体を優先する
-                        console.warn('[OfflineVideos] Failed to cache an optional offline asset:', error);
-                    }
-                }));
+                await OfflineVideoStorage.putJobIfVideoIdle(job, retryJobID);
+                isRegistered = true;
+                await this.prepareAssets(job, controller.signal);
+                controller.signal.throwIfAborted();
 
-                // 実況 API は応答が遅くなりがちで、保存開始自体はコメントがなくても問題ないため、動画転送の登録を待たせない
-                void (async () => {
-                    const jikkyoSource = `${Utils.api_base_url}/videos/${programSnapshot.id}/jikkyo`;
-                    const jikkyoDestination = `${generationBaseURL}/assets/jikkyo.json`;
-                    try {
-                        const assetResponse = await fetch(jikkyoSource);
-                        if (assetResponse.ok !== true) return;
-
-                        // キャンセルや失敗で世代が破棄された後の到着分を CacheStorage へ書き込まない
-                        const latestJob = await OfflineVideoStorage.getJob(job.job_id);
-                        if (latestJob === null || latestJob.generation_id !== generationID ||
-                        ['Failed', 'Cancelled'].includes(latestJob.state)) {
-                            return;
-                        }
-                        await cache.put(jikkyoDestination, assetResponse);
-
-                        // 状態確認と書き込みの間に終了した場合は、遅れて到着した実況データまで同じ失敗処理で回収する
-                        const jobAfterWrite = await OfflineVideoStorage.getJob(job.job_id);
-                        if (jobAfterWrite === null || jobAfterWrite.generation_id !== generationID ||
-                            ['Failed', 'Cancelled'].includes(jobAfterWrite.state)) {
-                            await cache.delete(jikkyoDestination);
-                        }
-                    } catch (error) {
-                        console.warn('[OfflineVideos] Failed to cache an optional offline asset:', error);
-                    }
-                })();
-
-                // 付随データの取得中にも別画面からキャンセルできるため、実際の動画転送を登録する直前に最新状態を確認する
-                if (await OfflineVideoStorage.updateActiveJob(job) === false) {
-                    throw new Error('オフライン保存はキャンセルされました。');
-                }
-            } catch (error) {
-            // 動画転送へ所有権を渡す前の失敗では、作成済みの断片と前景ロックをこの呼び出し内で回収する
-                releaseForegroundLock?.();
-                await this.markJobFailed(job.job_id, error instanceof Error ? error.message : 'オフライン保存を開始できませんでした。');
-                throw error;
-            }
-
-            if (shouldUseBackgroundFetch === true && job.background_fetch_id !== null) {
-                try {
+                if (job.background_fetch_id !== null) {
                     const registration = await navigator.serviceWorker.getRegistration();
-                    if (registration === undefined) {
-                        throw new Error('Service Worker の登録が見つかりません。');
-                    }
-                    const backgroundFetchManager = registration.backgroundFetch;
-                    if (backgroundFetchManager === undefined) {
+                    const manager = registration?.backgroundFetch;
+                    if (manager === undefined) {
                         throw new Error('Background Fetch API を利用できません。');
                     }
-                    await backgroundFetchManager.fetch(job.background_fetch_id, [request], {
+                    await this.updateJob(job);
+                    controller.signal.throwIfAborted();
+                    const request = new Request(`${Utils.api_base_url}/streams/video/${job.video_id}/${quality}/offline-stream`);
+                    const backgroundFetch = await manager.fetch(job.background_fetch_id, [request], {
                         title: `${programSnapshot.title}をオフライン保存`,
                         icons: [{src: '/assets/images/icons/icon-192px.png', sizes: '192x192', type: 'image/png'}],
                     });
-
-                    // 登録処理中にキャンセルされた場合は、ブラウザへ渡した直後の Background Fetch も確実に停止する
-                    if (await OfflineVideoStorage.updateActiveJob(job) === false) {
-                        const backgroundFetch = await backgroundFetchManager.get(job.background_fetch_id);
-                        await backgroundFetch?.abort();
-                        await OfflineVideoStorage.deleteGeneration(job.video_id, job.generation_id);
-                        throw new Error('オフライン保存はキャンセルされました。');
-                    }
-                } catch (error) {
-                // 登録失敗時は先に保存した付随データを残さず、一覧へ失敗理由を引き継ぐ
-                    await this.markJobFailed(job.job_id, error instanceof Error ? error.message : 'バックグラウンド保存を登録できませんでした。');
-                    throw error;
-                }
-                this.notifyChange();
-                return job;
-            }
-
-            // バックグラウンド保存を使わない場合は、ページが存続している間だけ通常の Fetch で同じ応答を保存する
-            try {
-                job.state = 'Downloading';
-                if (await OfflineVideoStorage.updateActiveJob(job) === false) {
-                    throw new Error('オフライン保存はキャンセルされました。');
-                }
-            } catch (error) {
-            // 転送処理へ引き渡す前の失敗は、この呼び出しで前景ロックを解放する
-                releaseForegroundLock?.();
-                await this.markJobFailed(job.job_id, error instanceof Error ? error.message : 'オフライン保存を開始できませんでした。');
-                throw error;
-            }
-            const abortController = new AbortController();
-            this.foregroundAbortControllers.set(job.job_id, abortController);
-            void (async () => {
-                let wakeLock: WakeLockSentinel | null = null;
-                let releaseForegroundActivityProtection: (() => void) | null = null;
-                try {
-                // 前景保存中だけ画面の自動消灯を抑え、Safari などで JavaScript 実行が止まる可能性を下げる
-                    if ('wakeLock' in navigator) {
-                        try {
-                            wakeLock = await navigator.wakeLock.request('screen');
-                        } catch (error) {
-                            console.warn('[OfflineVideos] Failed to acquire a screen wake lock:', error);
-                        }
-                    }
-
-                    // 無音音声は Chrome のバックグラウンド保護対象にならないため、ローカル WebRTC 接続でページ凍結を抑える
-                    // マイク権限や外部サーバーを使わない RTCDataChannel を、動画転送が終わるまで開いたまま保持する
                     try {
-                        releaseForegroundActivityProtection = await this.acquireForegroundActivityProtection();
-                    } catch (error) {
-                        console.warn('[OfflineVideos] Failed to acquire foreground activity protection:', error);
-                    }
-                    const response = await fetch(request, {signal: abortController.signal});
-                    if (response.ok === false) {
-                        throw new Error(`オフライン保存 API が HTTP ${response.status} を返しました。`);
-                    }
-                    await this.finalizeResponse(job.job_id, response);
-                } catch (error) {
-                    console.error('[OfflineVideos] Foreground offline download failed:', error);
-                    const latestJob = await OfflineVideoStorage.getJob(job.job_id);
-                    if (latestJob !== null && ['Waiting', 'Downloading', 'Finalizing'].includes(latestJob.state)) {
-                    // 利用者による中止とページ終了による fetch 中断の双方で、未完の断片を残さない
-                        if (abortController.signal.aborted === true) {
-                            await this.markJobCancelled(job.job_id);
-                        } else {
-                            await this.markJobFailed(job.job_id, error instanceof Error ? error.message : 'オフライン保存に失敗しました。');
+                        const latestJob = await OfflineVideoStorage.getJob(jobID);
+                        if (latestJob === null || latestJob.state === 'Cancelled' || latestJob.state === 'Failed') {
+                            throw new Error('オフライン保存はキャンセルされました。');
                         }
+                    } catch (error) {
+                        await backgroundFetch.abort();
+                        throw error;
+                    }
+                    this.notifyChange();
+                } else {
+                    isHandedOff = true;
+                    void this.runForegroundDownload(job, controller, releaseForegroundLock).catch((error: unknown) => {
+                        console.error('[OfflineVideos] Failed to finish offline download cleanup:', error);
+                    });
+                }
+                return job;
+            } catch (error) {
+                if (isRegistered) {
+                    const wasCancelled = controller.signal.aborted;
+                    controller.abort();
+                    if (wasCancelled) {
+                        await this.markJobCancelled(jobID);
+                    } else {
+                        await this.markJobFailed(jobID, error instanceof Error ? error.message : 'オフライン保存を開始できませんでした。');
+                    }
+                    await this.deleteIncompleteGeneration(job);
+                }
+                throw error;
+            } finally {
+                if (!isHandedOff) {
+                    this.jobAbortControllers.delete(jobID);
+                    releaseForegroundLock?.();
+                }
+            }
+        });
+    }
+
+    /** 失敗したジョブを同じ画質と保存方式で先頭からやり直す。 */
+    static async retry(jobID: string): Promise<IOfflineDownloadJob> {
+        const failedJob = await OfflineVideoStorage.getJob(jobID);
+        if (failedJob?.state !== 'Failed') {
+            throw new Error('やり直す保存が見つかりませんでした。');
+        }
+        const program = await Videos.fetchVideo(failedJob.video_id);
+        if (program === null) {
+            throw new Error('録画番組の情報を取得できませんでした。');
+        }
+        return await this.start(program, failedJob.quality, failedJob.background_fetch_id !== null, jobID);
+    }
+
+    private static async prepareAssets(job: IOfflineDownloadJob, signal: AbortSignal): Promise<void> {
+        const cache = await OfflineVideoStorage.openCache();
+        const baseURL = OfflineVideoStorage.getGenerationBaseURL(job.video_id, job.generation_id);
+        const assets = [
+            {source: Videos.getThumbnailURL(job.program), name: 'thumbnail.webp'},
+            {source: `${Utils.api_base_url}/videos/${job.video_id}/thumbnail/tiled`, name: 'thumbnail-tiled.webp'},
+        ];
+        if (job.program.channel !== null) {
+            assets.push({source: `${Utils.api_base_url}/channels/${job.program.channel.id}/logo`, name: 'channel-logo'});
+        }
+
+        // 終了時の世代回収より先にすべての cache.put() が決着するように待つ。
+        const results = await Promise.allSettled(assets.map(asset =>
+            this.cacheOptionalAsset(cache, asset.source, `${baseURL}/assets/${asset.name}`, signal),
+        ));
+        signal.throwIfAborted();
+        for (const result of results) {
+            if (result.status === 'rejected') {
+                throw result.reason;
+            }
+        }
+        await this.updateJob(job);
+
+        // 実況は保存開始と並行で処理し、先にジョブが終了した場合は遅れて保存されたデータも回収する。
+        void (async () => {
+            const destination = `${baseURL}/assets/jikkyo.json`;
+            await this.cacheOptionalAsset(cache, `${Utils.api_base_url}/videos/${job.video_id}/jikkyo`, destination, signal);
+            const latestJob = await OfflineVideoStorage.getJob(job.job_id);
+            if (latestJob === null || latestJob.state === 'Failed' || latestJob.state === 'Cancelled') {
+                await cache.delete(destination);
+            }
+        })().catch((error: unknown) => {
+            console.warn('[OfflineVideos] Failed to cache offline comments:', error);
+        });
+    }
+
+    private static async cacheOptionalAsset(cache: Cache, source: string, destination: string, signal: AbortSignal): Promise<void> {
+        const {controller, dispose} = this.linkAbortController(signal);
+        const timeout = setTimeout(() => controller.abort(), 30_000);
+        let reader: ReadableStreamDefaultReader<Uint8Array> | undefined;
+        let bodyReadFailed = false;
+        try {
+            const response = await this.fetchResponse(source, {signal: controller.signal});
+            if (!response.ok) {
+                console.warn('[OfflineVideos] Optional offline asset returned HTTP', response.status);
+                return;
+            }
+            reader = response.body?.getReader();
+            const bodyReader = reader;
+            const body = bodyReader === undefined ? null : new ReadableStream<Uint8Array>({
+                async pull(stream) {
+                    let result: ReadableStreamReadResult<Uint8Array>;
+                    try {
+                        result = await bodyReader.read();
+                    } catch (error) {
+                        bodyReadFailed = true;
+                        stream.error(error);
+                        return;
+                    }
+                    if (result.done) {
+                        stream.close();
+                    } else {
+                        stream.enqueue(result.value);
+                    }
+                },
+                cancel: () => bodyReader.cancel(),
+            });
+            await cache.put(destination, new Response(body, {
+                status: response.status,
+                statusText: response.statusText,
+                headers: response.headers,
+            }));
+        } catch (error) {
+            signal.throwIfAborted();
+            if (error instanceof OfflineDownloadNetworkError || bodyReadFailed) {
+                console.warn('[OfflineVideos] Failed to download an optional offline asset:', error);
+                return;
+            }
+            throw error;
+        } finally {
+            clearTimeout(timeout);
+            controller.abort();
+            dispose();
+            if (reader !== undefined) {
+                await reader.cancel().catch(() => {});
+                reader.releaseLock();
+            }
+        }
+    }
+
+    private static async runForegroundDownload(
+        job: IOfflineDownloadJob,
+        controller: AbortController,
+        releaseForegroundLock: (() => void) | null,
+    ): Promise<void> {
+        const signal = controller.signal;
+        const sessionID = Array.from(crypto.getRandomValues(new Uint8Array(16)), value =>
+            value.toString(16).padStart(2, '0'),
+        ).join('');
+        const url = `${Utils.api_base_url}/streams/video/${job.video_id}/${job.quality}/offline-sessions/${sessionID}`;
+        let sessionInfo: IOfflineVideoSessionInfo | undefined;
+        let wakeLock: WakeLockSentinel | undefined;
+        let releaseActivity: (() => void) | null = null;
+        try {
+            // 前景保存中だけ、画面の消灯とバックグラウンドでのページ凍結を抑える。
+            if ('wakeLock' in navigator) {
+                try {
+                    wakeLock = await navigator.wakeLock.request('screen');
+                } catch (error) {
+                    console.warn('[OfflineVideos] Failed to acquire a screen wake lock:', error);
+                }
+            }
+            try {
+                signal.throwIfAborted();
+                releaseActivity = await this.acquireForegroundActivityProtection(signal);
+            } catch (error) {
+                signal.throwIfAborted();
+                console.warn('[OfflineVideos] Failed to acquire foreground activity protection:', error);
+            }
+            sessionInfo = await this.createSession(url, signal);
+            signal.throwIfAborted();
+            if (!this.matchesJob(sessionInfo, job)) {
+                throw new Error('オフライン保存の開始応答が録画番組や画質と一致しません。');
+            }
+
+            const cache = await OfflineVideoStorage.openCache();
+            const progress: IOfflineDownloadProgress = {segmentDurations: [], sizeBytes: 0};
+            let connectionID = 0;
+            let reconnectCount = 0;
+            let reconnectDeadline = 0;
+            while (true) {
+                const nextSequence = progress.segmentDurations.length;
+                const connection = this.linkAbortController(signal);
+                let checkpointTask: Promise<void> | undefined;
+                let checkpointError: unknown;
+                let reconnectError: OfflineDownloadNetworkError;
+                try {
+                    signal.throwIfAborted();
+                    if (reconnectCount > 0 && performance.now() >= reconnectDeadline) {
+                        throw new Error('通信を再開できませんでした。');
+                    }
+                    connectionID++;
+                    const response = await this.openSessionStream(
+                        url, sessionInfo, nextSequence, connectionID, connection.controller,
+                    );
+                    job.state = 'Downloading';
+                    await this.updateJob(job);
+                    checkpointTask = this.sendCheckpoints(url, sessionInfo, connectionID, progress, connection.controller.signal)
+                        .catch((error: unknown) => {
+                            if (connection.controller.signal.aborted === false) {
+                                checkpointError = error;
+                                connection.controller.abort();
+                            }
+                        });
+                    const metadata = await this.receiveSegments(job, response, cache, progress, {
+                        sessionID,
+                        info: sessionInfo,
+                        controller: connection.controller,
+                    });
+                    connection.controller.abort();
+                    await checkpointTask;
+                    if (checkpointError !== undefined) throw checkpointError;
+                    signal.throwIfAborted();
+                    await this.completeDownload(job, cache, metadata, progress);
+                    return;
+                } catch (error) {
+                    signal.throwIfAborted();
+                    if (checkpointError !== undefined) throw checkpointError;
+                    if (error instanceof OfflineDownloadNetworkError === false) throw error;
+                    reconnectError = error;
+                    if (progress.segmentDurations.length > nextSequence) {
+                        reconnectCount = 0;
+                    }
+                    if (reconnectCount === 0) {
+                        reconnectDeadline = performance.now() + this.RECONNECT_BUDGET;
                     }
                 } finally {
-                    // ページ凍結防止用の WebRTC 接続を先に閉じ、前景保存中だけの資源利用に限定する
-                    releaseForegroundActivityProtection?.();
-
-                    // Wake Lock の解放失敗でも、前景保存の所有情報と Web Lock は必ず回収する
-                    this.foregroundAbortControllers.delete(job.job_id);
-                    releaseForegroundLock?.();
-                    try {
-                        await wakeLock?.release();
-                    } catch (error) {
-                        console.warn('[OfflineVideos] Failed to release the screen wake lock:', error);
-                    }
+                    // 次の GET の前に旧接続の制御要求を中断する。本文 reader は receiveSegments() が回収する。
+                    connection.controller.abort();
+                    connection.dispose();
+                    await checkpointTask;
                 }
-            })();
-            return job;
+
+                job.downloaded_bytes = progress.sizeBytes;
+                this.setReconnecting(job.job_id, true);
+                await this.updateJob(job);
+                await this.waitToReconnect(reconnectError, reconnectCount, reconnectDeadline, signal);
+                reconnectCount++;
+            }
+        } catch (error) {
+            try {
+                if (signal.aborted) {
+                    await this.markJobCancelled(job.job_id);
+                } else {
+                    console.error('[OfflineVideos] Foreground offline download failed:', error);
+                    await this.markJobFailed(job.job_id, error instanceof Error ? error.message : 'オフライン保存に失敗しました。');
+                }
+            } finally {
+                await this.deleteIncompleteGeneration(job);
+            }
+        } finally {
+            this.setReconnecting(job.job_id, false);
+            this.jobAbortControllers.delete(job.job_id);
+            releaseActivity?.();
+            releaseForegroundLock?.();
+            void wakeLock?.release().catch((error: unknown) => {
+                console.warn('[OfflineVideos] Failed to release the screen wake lock:', error);
+            });
+            if (sessionInfo !== undefined) {
+                const cleanupController = new AbortController();
+                const timeout = setTimeout(() => cleanupController.abort(), 5000);
+                try {
+                    const response = await this.fetchResponse(url, {
+                        method: 'DELETE',
+                        headers: {'X-KonomiTV-Offline-Generation': sessionInfo.generation_token},
+                        signal: cleanupController.signal,
+                    });
+                    if (!response.ok) console.warn('[OfflineVideos] Offline download cleanup returned HTTP', response.status);
+                } catch (error) {
+                    console.warn('[OfflineVideos] Could not notify the server that offline saving ended:', error);
+                } finally {
+                    clearTimeout(timeout);
+                    cleanupController.abort();
+                }
+            }
+        }
+    }
+
+    private static async createSession(url: string, signal: AbortSignal): Promise<IOfflineVideoSessionInfo> {
+        let retryCount = 0;
+        let retryDeadline = 0;
+        while (true) {
+            signal.throwIfAborted();
+            if (retryCount > 0 && performance.now() >= retryDeadline) {
+                throw new Error('オフライン保存の接続を開始できませんでした。');
+            }
+            const {controller, dispose} = this.linkAbortController(signal);
+            const timeout = setTimeout(() => controller.abort(), 30_000);
+            let retryError: OfflineDownloadNetworkError;
+            try {
+                const response = await this.fetchResponse(url, {method: 'PUT', signal: controller.signal});
+                await this.checkSessionResponse(response, controller.signal);
+                if (response.status !== 201 && response.status !== 200) {
+                    throw new Error('オフライン保存の開始応答が不正です。');
+                }
+                const info: unknown = await this.readSessionJSON(response, controller.signal);
+                if (!this.isSessionInfo(info)) {
+                    throw new Error('オフライン保存の開始応答が不正です。');
+                }
+                return info;
+            } catch (error) {
+                signal.throwIfAborted();
+                if (error instanceof OfflineDownloadNetworkError === false) throw error;
+                retryError = error;
+            } finally {
+                clearTimeout(timeout);
+                controller.abort();
+                dispose();
+            }
+            if (retryError.status === 429) {
+                await this.waitForDelay(Math.max(5000, retryError.retryAfterMilliseconds), signal);
+                retryCount = 0;
+                continue;
+            }
+            if (retryCount === 0) retryDeadline = performance.now() + this.RECONNECT_BUDGET;
+            await this.waitToReconnect(retryError, retryCount, retryDeadline, signal);
+            retryCount++;
+        }
+    }
+
+    private static async openSessionStream(
+        url: string,
+        info: IOfflineVideoSessionInfo,
+        nextSequence: number,
+        connectionID: number,
+        controller: AbortController,
+    ): Promise<Response> {
+        const timeout = setTimeout(() => controller.abort(new OfflineDownloadNetworkError('オフライン保存の接続がタイムアウトしました。')), 30_000);
+        try {
+            const response = await this.fetchResponse(`${url}?next_sequence=${nextSequence}&connection_id=${connectionID}`, {
+                headers: {'X-KonomiTV-Offline-Generation': info.generation_token},
+                signal: controller.signal,
+            });
+            controller.signal.throwIfAborted();
+            await this.checkSessionResponse(response, controller.signal);
+            if (response.status !== 200) {
+                throw new Error('オフライン保存の配信応答が不正です。');
+            }
+            return response;
+        } finally {
+            clearTimeout(timeout);
+        }
+    }
+
+    private static async sendCheckpoints(
+        url: string,
+        info: IOfflineVideoSessionInfo,
+        connectionID: number,
+        progress: IOfflineDownloadProgress,
+        signal: AbortSignal,
+    ): Promise<void> {
+        let lastSentAt = performance.now();
+        let lastAcknowledged = progress.segmentDurations.length;
+        while (true) {
+            await this.waitForDelay(1000, signal);
+            const nextSequence = progress.segmentDurations.length;
+            const interval = nextSequence > lastAcknowledged ? 3000 : 10_000;
+            if (performance.now() - lastSentAt < interval) continue;
+
+            // 同じ位置でも生存通知を送る。通信に失敗したときは最新の位置を次回送信する。
+            lastSentAt = performance.now();
+            const {controller, dispose} = this.linkAbortController(signal);
+            const timeout = setTimeout(() => controller.abort(), 10_000);
+            try {
+                const response = await this.fetchResponse(`${url}/checkpoint`, {
+                    method: 'PUT',
+                    headers: {
+                        'Content-Type': 'application/json',
+                        'X-KonomiTV-Offline-Generation': info.generation_token,
+                    },
+                    body: JSON.stringify({connection_id: connectionID, next_sequence: nextSequence}),
+                    signal: controller.signal,
+                });
+                await this.checkSessionResponse(response, controller.signal);
+                const result = await this.readSessionJSON(response, controller.signal) as {connection_id?: number; next_sequence?: number} | null;
+                if (result?.connection_id !== connectionID || typeof result.next_sequence !== 'number' ||
+                    !Number.isInteger(result.next_sequence) || result.next_sequence < nextSequence ||
+                    result.next_sequence > progress.segmentDurations.length) {
+                    throw new Error('オフライン保存の進捗確認に失敗しました。');
+                }
+                lastAcknowledged = result.next_sequence;
+            } catch (error) {
+                signal.throwIfAborted();
+                if (error instanceof OfflineDownloadNetworkError === false) throw error;
+            } finally {
+                clearTimeout(timeout);
+                controller.abort();
+                dispose();
+            }
+        }
+    }
+
+    private static async fetchResponse(url: string, options: RequestInit): Promise<Response> {
+        const request = new Request(url, {...options, cache: 'no-store', redirect: 'error'});
+        try {
+            return await fetch(request);
+        } catch (error) {
+            if (options.signal?.aborted || error instanceof TypeError || (error instanceof DOMException && error.name === 'NetworkError')) {
+                throw new OfflineDownloadNetworkError('オフライン保存の通信が途切れました。');
+            }
+            throw error;
+        }
+    }
+
+    private static async checkSessionResponse(response: Response, signal: AbortSignal): Promise<void> {
+        if (response.ok) return;
+        if ([408, 429, 502, 503, 504].includes(response.status)) {
+            const retryAfter = response.headers.get('Retry-After');
+            let milliseconds = 0;
+            if (retryAfter !== null) {
+                const seconds = Number(retryAfter);
+                milliseconds = Number.isFinite(seconds) ? seconds * 1000 : Date.parse(retryAfter) - Date.now();
+            }
+            throw new OfflineDownloadNetworkError(
+                `オフライン保存の通信に失敗しました。(HTTP ${response.status})`,
+                Number.isFinite(milliseconds) ? Math.max(0, milliseconds) : 0,
+                response.status,
+            );
+        }
+        if (response.status === 410) {
+            throw new Error('オフライン保存を再開できませんでした。');
+        }
+        if (response.status === 409) {
+            type ErrorResponse = {detail?: {code?: string}};
+            let errorResponse: ErrorResponse | null = null;
+            try {
+                errorResponse = await this.readSessionJSON(response, signal) as ErrorResponse | null;
+            } catch (error) {
+                console.warn('[OfflineVideos] Could not read the offline download error response:', error);
+            }
+            if (errorResponse?.detail?.code === 'recording_changed' || errorResponse?.detail?.code === 'recording_unavailable') {
+                throw new Error('録画ファイルが変わったか、現在は保存できない状態です。');
+            }
+            throw new Error('サーバーがオフライン保存の続行を拒否しました。');
+        }
+        throw new Error(`オフライン保存に失敗しました。(HTTP ${response.status})`);
+    }
+
+    private static async readSessionJSON(response: Response, signal: AbortSignal): Promise<unknown> {
+        try {
+            return await response.json() as unknown;
+        } catch (error) {
+            if (signal.aborted || error instanceof TypeError || (error instanceof DOMException && error.name === 'NetworkError')) {
+                throw new OfflineDownloadNetworkError('オフライン保存の応答を受信できませんでした。');
+            }
+            if (error instanceof SyntaxError) {
+                throw new Error('オフライン保存の応答が不正です。');
+            }
+            throw error;
+        }
+    }
+
+    private static isSessionInfo(info: unknown): info is IOfflineVideoSessionInfo {
+        if (typeof info !== 'object' || info === null) return false;
+        const data = info as Partial<IOfflineVideoSessionInfo>;
+        return data.protocol_version === 2 &&
+            typeof data.generation_token === 'string' && /^[0-9a-f]{32}$/.test(data.generation_token) &&
+            typeof data.lease_timeout_seconds === 'number' && data.lease_timeout_seconds > 0 &&
+            Number.isFinite(data.lease_timeout_seconds) &&
+            typeof data.max_segment_bytes === 'number' && Number.isInteger(data.max_segment_bytes) &&
+            data.max_segment_bytes > 0 && data.max_segment_bytes <= this.MAX_SEGMENT_BYTES;
+    }
+
+    private static matchesJob(metadata: IOfflineVideoStreamMetadata, job: IOfflineDownloadJob): boolean {
+        return metadata.video_id === job.video_id && metadata.file_hash === job.program.recorded_video.file_hash &&
+            metadata.quality === job.quality && Number.isFinite(metadata.duration_seconds) && metadata.duration_seconds > 0;
+    }
+
+    private static linkAbortController(signal: AbortSignal): {controller: AbortController; dispose: () => void} {
+        const controller = new AbortController();
+        const onAbort = () => controller.abort();
+        if (signal.aborted) {
+            controller.abort();
+        } else {
+            signal.addEventListener('abort', onAbort, {once: true});
+        }
+        return {controller, dispose: () => signal.removeEventListener('abort', onAbort)};
+    }
+
+    private static async waitForDelay(milliseconds: number, signal: AbortSignal): Promise<void> {
+        signal.throwIfAborted();
+        await new Promise<void>((resolve, reject) => {
+            const onAbort = () => {
+                clearTimeout(timeout);
+                reject(signal.reason);
+            };
+            const timeout = setTimeout(() => {
+                signal.removeEventListener('abort', onAbort);
+                resolve();
+            }, milliseconds);
+            signal.addEventListener('abort', onAbort, {once: true});
         });
+    }
+
+    private static async waitToReconnect(
+        error: OfflineDownloadNetworkError,
+        reconnectCount: number,
+        deadline: number,
+        signal: AbortSignal,
+    ): Promise<void> {
+        const delay = this.RECONNECT_DELAYS[reconnectCount];
+        if (delay === undefined) throw new Error('通信を再開できませんでした。');
+        const wait = Math.max(delay * (0.8 + Math.random() * 0.4), error.retryAfterMilliseconds);
+        if (performance.now() + wait >= deadline) throw new Error('通信を再開できませんでした。');
+        await this.waitForDelay(wait, signal);
+    }
+
+    private static setReconnecting(jobID: string, isReconnecting: boolean): void {
+        if (isReconnecting === this.reconnectingJobs.has(jobID)) return;
+        if (isReconnecting) {
+            this.reconnectingJobs.add(jobID);
+        } else {
+            this.reconnectingJobs.delete(jobID);
+        }
+        this.notifyChange();
+    }
+
+    private static async updateJob(job: IOfflineDownloadJob): Promise<void> {
+        if (await OfflineVideoStorage.updateActiveJob(job) === false) {
+            throw new Error('オフライン保存はすでに終了しています。');
+        }
+    }
+
+    private static async deleteIncompleteGeneration(job: IOfflineDownloadJob): Promise<void> {
+        const savedVideo = await OfflineVideoStorage.getStoredVideo(job.video_id);
+        if (savedVideo?.generation_id !== job.generation_id) {
+            await OfflineVideoStorage.deleteGeneration(job.video_id, job.generation_id);
+        }
     }
 
     /**
@@ -444,185 +879,198 @@ export default class OfflineVideos {
      * @param response オフライン保存 API の応答
      */
     static async finalizeResponse(jobID: string, response: Response): Promise<void> {
-
         const job = await OfflineVideoStorage.getJob(jobID);
-        if (job === null || response.body === null) {
-            throw new Error('保存ジョブまたはレスポンス本体が見つかりません。');
+        if (job === null) {
+            throw new Error('保存ジョブが見つかりません。');
         }
-        job.state = 'Downloading';
-        if (await OfflineVideoStorage.updateActiveJob(job) === false) {
-            throw new Error('オフライン保存ジョブはすでに終了しています。');
+        try {
+            job.state = 'Downloading';
+            job.downloaded_bytes = 0;
+            await this.updateJob(job);
+            const cache = await OfflineVideoStorage.openCache();
+            const progress: IOfflineDownloadProgress = {segmentDurations: [], sizeBytes: 0};
+            const metadata = await this.receiveSegments(job, response, cache, progress);
+            await this.completeDownload(job, cache, metadata, progress);
+        } catch (error) {
+            // Service Worker が最終状態を確定する。キャンセル後に書き込まれた断片も回収する。
+            await this.deleteIncompleteGeneration(job);
+            throw error;
         }
+    }
 
+    private static async receiveSegments(
+        job: IOfflineDownloadJob,
+        response: Response,
+        cache: Cache,
+        progress: IOfflineDownloadProgress,
+        connection?: IOfflineVideoConnection,
+    ): Promise<IOfflineVideoStreamMetadata> {
+        if (response.body === null) throw new Error('オフライン保存の応答本体がありません。');
         const reader = response.body.getReader();
-        const pendingChunks: Uint8Array[] = [];
-        let pendingChunkIndex = 0;
-        let pendingChunkOffset = 0;
-        let pendingLength = 0;
-        let isStreamFinished = false;
-        let sizeBytes = 0;
-        let segmentCount = 0;
+        const signal = connection?.controller.signal;
+        const baseURL = OfflineVideoStorage.getGenerationBaseURL(job.video_id, job.generation_id);
+        let chunk: Uint8Array | undefined;
+        let chunkOffset = 0;
+        let lastPersistedProgressAt = performance.now();
         let lastPersistedProgressBytes = job.downloaded_bytes;
-        let lastPersistedProgressAt = Date.now();
-        const segmentDurations: number[] = [];
-        const cache = await OfflineVideoStorage.openCache();
-        const generationBaseURL = OfflineVideoStorage.getGenerationBaseURL(job.video_id, job.generation_id);
 
-        /** 指定バイト数をネットワークチャンク列から読み取る */
-        const readBytes = async (length: number): Promise<Uint8Array> => {
-            while (pendingLength < length && isStreamFinished === false) {
-                const result = await reader.read();
-                if (result.done === true) {
-                    isStreamFinished = true;
-                    break;
-                }
-                pendingChunks.push(result.value);
-                pendingLength += result.value.byteLength;
-                job.downloaded_bytes += result.value.byteLength;
-
-                // ネットワークチャンクごとの書き込みを避け、進捗表示に十分な間隔だけ IndexedDB を更新する
-                const currentTime = Date.now();
-                if (job.downloaded_bytes - lastPersistedProgressBytes >= 1024 * 1024 || currentTime - lastPersistedProgressAt >= 250) {
-                    if (await OfflineVideoStorage.updateActiveJob(job) === false) {
-                        throw new Error('オフライン保存がキャンセルされました。');
-                    }
-                    lastPersistedProgressBytes = job.downloaded_bytes;
-                    lastPersistedProgressAt = currentTime;
-                }
-            }
-            if (pendingLength < length) {
-                throw new Error('オフライン保存データが途中で終了しました。');
-            }
-
-            // 受信済みデータの全連結を避け、呼び出し元が必要とする長さの領域だけを割り当てる
+        /** 必要な領域へ直接コピーし、読み取り待ちの時間だけを通信の無受信時間として扱う。 */
+        const readBytes = async (length: number, isSegmentBody = false): Promise<Uint8Array> => {
             const output = new Uint8Array(length);
-            let outputOffset = 0;
-            while (outputOffset < length) {
-                const chunk = pendingChunks[pendingChunkIndex];
-                const availableChunkLength = chunk.byteLength - pendingChunkOffset;
-                const copyLength = Math.min(availableChunkLength, length - outputOffset);
-                output.set(chunk.subarray(pendingChunkOffset, pendingChunkOffset + copyLength), outputOffset);
-                outputOffset += copyLength;
-                pendingChunkOffset += copyLength;
-
-                // チャンク全体を読み終えたら次のチャンクへ進む
-                if (pendingChunkOffset === chunk.byteLength) {
-                    pendingChunkIndex++;
-                    pendingChunkOffset = 0;
+            let offset = 0;
+            while (offset < length) {
+                signal?.throwIfAborted();
+                if (chunk === undefined || chunkOffset === chunk.byteLength) {
+                    const timeout = connection === undefined ? undefined : setTimeout(() => {
+                        connection.controller.abort(new OfflineDownloadNetworkError('オフライン保存の受信がタイムアウトしました。'));
+                    }, 30_000);
+                    let result: ReadableStreamReadResult<Uint8Array>;
+                    try {
+                        result = await reader.read();
+                    } catch (error) {
+                        if (connection !== undefined && (
+                            signal?.aborted || error instanceof TypeError || (error instanceof DOMException && error.name === 'NetworkError')
+                        )) {
+                            throw new OfflineDownloadNetworkError('オフライン保存の通信が途切れました。');
+                        }
+                        throw error;
+                    } finally {
+                        clearTimeout(timeout);
+                    }
+                    if (result.done) {
+                        throw new OfflineDownloadNetworkError('オフライン保存データが途中で終了しました。');
+                    }
+                    chunk = result.value;
+                    chunkOffset = 0;
                 }
-            }
-            pendingLength -= length;
-
-            // 長時間の保存で読み終えたチャンクへの参照を保持し続けないよう、一定数ごとに配列先頭を回収する
-            if (pendingChunkIndex >= 32) {
-                pendingChunks.splice(0, pendingChunkIndex);
-                pendingChunkIndex = 0;
+                const copyLength = Math.min(length - offset, chunk.byteLength - chunkOffset);
+                output.set(chunk.subarray(chunkOffset, chunkOffset + copyLength), offset);
+                offset += copyLength;
+                chunkOffset += copyLength;
+                if (isSegmentBody) {
+                    job.downloaded_bytes = progress.sizeBytes + offset;
+                    const currentTime = performance.now();
+                    if (job.downloaded_bytes - lastPersistedProgressBytes >= 1024 * 1024 || currentTime - lastPersistedProgressAt >= 250) {
+                        await this.updateJob(job);
+                        lastPersistedProgressAt = currentTime;
+                        lastPersistedProgressBytes = job.downloaded_bytes;
+                    }
+                }
             }
             return output;
         };
 
         try {
-            // 固定マジック値が一致しない応答は、サーバーのエラーページや未知の将来形式なので保存しない
             const magic = await readBytes(this.STREAM_MAGIC.byteLength);
             if (magic.some((value, index) => value !== this.STREAM_MAGIC[index])) {
                 throw new Error('オフライン保存データの形式を認識できません。');
             }
 
-            // 先頭 JSON から録画ファイルと画質を検証し、別リクエストの応答を混在させない
             const metadataLength = new DataView((await readBytes(4)).buffer).getUint32(0);
             if (metadataLength === 0 || metadataLength > 1024 * 1024) {
                 throw new Error('オフライン保存データのメタデータ長が不正です。');
             }
-            const metadata = JSON.parse(new TextDecoder().decode(await readBytes(metadataLength))) as IOfflineVideoStreamMetadata;
-            if (metadata.video_id !== job.video_id || metadata.file_hash !== job.program.recorded_video.file_hash ||
-                metadata.quality !== job.quality) {
-                throw new Error('オフライン保存データのメタデータが保存ジョブと一致しません。');
+            const metadata = JSON.parse(new TextDecoder('utf-8', {fatal: true}).decode(await readBytes(metadataLength))) as
+                IOfflineVideoStreamMetadata & Partial<IOfflineVideoSessionInfo> & {session_id?: string; next_sequence?: number};
+            if (metadata === null || !this.matchesJob(metadata, job)) {
+                throw new Error('オフライン保存データが録画番組や画質と一致しません。');
+            }
+            let maxSegmentBytes = 128 * 1024 * 1024;
+            if (connection !== undefined) {
+                const {info} = connection;
+                if (metadata.session_id !== connection.sessionID || metadata.next_sequence !== progress.segmentDurations.length ||
+                    !this.isSessionInfo(metadata) || metadata.generation_token !== info.generation_token ||
+                    metadata.duration_seconds !== info.duration_seconds || metadata.lease_timeout_seconds !== info.lease_timeout_seconds ||
+                    metadata.max_segment_bytes !== info.max_segment_bytes) {
+                    throw new Error('オフライン保存の配信応答が開始時の情報と一致しません。');
+                }
+                maxSegmentBytes = info.max_segment_bytes;
+                this.setReconnecting(job.job_id, false);
             }
 
             while (true) {
-                // 終端レコードは sequence と件数の8バイト、それ以外は長さを含む12バイトで判別する
-                const sequence = new DataView((await readBytes(4)).buffer).getUint32(0);
+                // keepalive と終端は 8 バイト、映像レコードは 12 バイトのヘッダーを持つ。
+                const record = new DataView((await readBytes(8)).buffer);
+                const sequence = record.getUint32(0);
+                const value = record.getUint32(4);
                 if (sequence === 0xffffffff) {
-                    const expectedSegmentCount = new DataView((await readBytes(4)).buffer).getUint32(0);
-                    if (expectedSegmentCount !== segmentCount) {
+                    if (value === 0 || value !== progress.segmentDurations.length) {
                         throw new Error('オフライン保存データのセグメント数が一致しません。');
                     }
-                    break;
+                    return metadata;
                 }
-                const recordHeader = new DataView((await readBytes(8)).buffer);
-                const durationMilliseconds = recordHeader.getUint32(0);
-                const segmentLength = recordHeader.getUint32(4);
-                if (sequence !== segmentCount || durationMilliseconds === 0 || segmentLength === 0 || segmentLength > 128 * 1024 * 1024) {
+                if (sequence === 0xfffffffe && connection !== undefined && value === 0) {
+                    continue;
+                }
+                if (sequence !== progress.segmentDurations.length || value === 0) {
                     throw new Error('オフライン保存データのセグメントヘッダーが不正です。');
                 }
-                const segmentData = await readBytes(segmentLength);
-                await cache.put(`${generationBaseURL}/segments/${sequence}.ts`, new Response(segmentData, {
+                const segmentLength = new DataView((await readBytes(4)).buffer).getUint32(0);
+                if (segmentLength === 0 || segmentLength > maxSegmentBytes) {
+                    throw new Error('オフライン保存データのセグメントの長さが不正です。');
+                }
+                const segmentData = await readBytes(segmentLength, true);
+                signal?.throwIfAborted();
+                await cache.put(`${baseURL}/segments/${sequence}.ts`, new Response(segmentData, {
                     headers: {'Content-Type': 'video/mp2t'},
                 }));
-                segmentDurations.push(durationMilliseconds / 1000);
-                segmentCount++;
-                sizeBytes += segmentLength;
+                // CacheStorage とジョブ状態の確定を待ってから、次に要求する番号を進める。
+                await this.updateJob(job);
+                progress.segmentDurations.push(value / 1000);
+                progress.sizeBytes += segmentLength;
             }
-
-            // 保存した実データだけを指す VOD プレイリストを生成し、通常再生のセッション API から完全に切り離す
-            job.state = 'Finalizing';
-            if (await OfflineVideoStorage.updateActiveJob(job) === false) {
-                throw new Error('オフライン保存がキャンセルされました。');
-            }
-            if (segmentDurations.length === 0) {
-                throw new Error('オフライン保存データに映像セグメントがありません。');
-            }
-            const targetDuration = Math.ceil(segmentDurations.reduce((maximum, duration) => Math.max(maximum, duration), 0));
-            let playlist = '#EXTM3U\n#EXT-X-VERSION:6\n#EXT-X-PLAYLIST-TYPE:VOD\n';
-            playlist += `#EXT-X-TARGETDURATION:${targetDuration}\n`;
-            segmentDurations.forEach((duration, sequence) => {
-                playlist += `#EXTINF:${duration.toFixed(3)},\nsegments/${sequence}.ts\n`;
+        } finally {
+            await reader.cancel().catch((error: unknown) => {
+                if (signal?.aborted !== true) {
+                    console.warn('[OfflineVideos] Failed to cancel the offline download response reader:', error);
+                }
             });
-            playlist += '#EXT-X-ENDLIST\n';
-            await cache.put(`${generationBaseURL}/playlist.m3u8`, new Response(playlist, {
-                headers: {'Content-Type': 'application/vnd.apple.mpegurl'},
-            }));
-
-            // 新世代の全データを書き終えてから動画レコードを差し替え、再生側が途中データを参照する時間を作らない
-            const previousVideo = await this.getVideo(job.video_id);
-            const video: IOfflineVideo = {
-                video_id: job.video_id,
-                generation_id: job.generation_id,
-                file_hash: metadata.file_hash,
-                program: job.program,
-                quality: job.quality,
-                size_bytes: sizeBytes,
-                segment_count: segmentCount,
-                saved_at: Date.now(),
-            };
-            const isCompleted = await OfflineVideoStorage.completeJob(job, video);
-            if (isCompleted === false) {
-                // 展開中にキャンセルされた場合は動画一覧へ追加せず、キャンセル後に書き込まれた断片も回収する
-                await OfflineVideoStorage.deleteGeneration(job.video_id, job.generation_id);
-                return;
-            }
-
-            // 有効世代を切り替えた後なら、削除中も必ず新しい保存データから再生できる
-            if (previousVideo !== null && previousVideo.generation_id !== video.generation_id) {
-                await OfflineVideoStorage.deleteGeneration(previousVideo.video_id, previousVideo.generation_id);
-            }
-            this.notifyChange();
-        } catch (error) {
-            // 破損応答や保存キャンセルでは未読部分の受信を打ち切り、ネットワーク接続とストリームロックを解放する
-            try {
-                await reader.cancel();
-            } catch (cancelError) {
-                console.warn('[OfflineVideos] Failed to cancel the offline download response reader:', cancelError);
-            }
-            await this.markJobFailed(job.job_id, error instanceof Error ? error.message : 'オフライン保存データを処理できませんでした。');
-
-            // キャンセル処理の削除後に受信処理が書いた断片も回収し、完了済みの有効世代だけは保持する
-            const savedVideo = await OfflineVideoStorage.getStoredVideo(job.video_id);
-            if (savedVideo?.generation_id !== job.generation_id) {
-                await OfflineVideoStorage.deleteGeneration(job.video_id, job.generation_id);
-            }
-            throw error;
+            reader.releaseLock();
         }
+    }
+
+    private static async completeDownload(
+        job: IOfflineDownloadJob,
+        cache: Cache,
+        metadata: IOfflineVideoStreamMetadata,
+        progress: IOfflineDownloadProgress,
+    ): Promise<void> {
+        job.state = 'Finalizing';
+        await this.updateJob(job);
+        const baseURL = OfflineVideoStorage.getGenerationBaseURL(job.video_id, job.generation_id);
+        const {segmentDurations, sizeBytes} = progress;
+        const targetDuration = Math.ceil(segmentDurations.reduce((maximum, duration) => Math.max(maximum, duration), 0));
+        let playlist = '#EXTM3U\n#EXT-X-VERSION:6\n#EXT-X-PLAYLIST-TYPE:VOD\n';
+        playlist += `#EXT-X-TARGETDURATION:${targetDuration}\n`;
+        segmentDurations.forEach((duration, sequence) => {
+            playlist += `#EXTINF:${duration.toFixed(3)},\nsegments/${sequence}.ts\n`;
+        });
+        playlist += '#EXT-X-ENDLIST\n';
+        await cache.put(`${baseURL}/playlist.m3u8`, new Response(playlist, {
+            headers: {'Content-Type': 'application/vnd.apple.mpegurl'},
+        }));
+
+        // 完成した動画とジョブを同じトランザクションで切り替えてから旧データを回収する。
+        const previousVideo = await OfflineVideoStorage.getStoredVideo(job.video_id);
+        const video: IOfflineVideo = {
+            video_id: job.video_id,
+            generation_id: job.generation_id,
+            file_hash: metadata.file_hash,
+            program: job.program,
+            quality: job.quality,
+            size_bytes: sizeBytes,
+            segment_count: segmentDurations.length,
+            saved_at: Date.now(),
+        };
+        if (!await OfflineVideoStorage.completeJob(job, video)) {
+            throw new Error('オフライン保存はすでに終了しています。');
+        }
+        if (previousVideo !== null && previousVideo.generation_id !== video.generation_id) {
+            await OfflineVideoStorage.deleteGeneration(previousVideo.video_id, previousVideo.generation_id).catch((error: unknown) => {
+                console.warn('[OfflineVideos] Failed to delete the previous offline video data:', error);
+            });
+        }
+        this.notifyChange();
     }
 
     /**
@@ -897,15 +1345,18 @@ export default class OfflineVideos {
         const job = await OfflineVideoStorage.transitionActiveJobToTerminalState(jobID, 'Cancelled', null);
         if (job === null) return;
 
-        // Background Fetch の停止はブラウザへ任せ、前景 Fetch は世代削除と状態変更で後続処理を無効化する
-        if (job.background_fetch_id !== null && 'serviceWorker' in navigator) {
-            const registration = await navigator.serviceWorker.getRegistration();
-            const backgroundFetch = await registration?.backgroundFetch?.get(job.background_fetch_id);
-            await backgroundFetch?.abort();
-        } else {
-            this.foregroundAbortControllers.get(job.job_id)?.abort();
+        // 通信の準備中は Background Fetch のジョブもこのページが中止する。
+        this.jobAbortControllers.get(jobID)?.abort();
+        this.cancellationChannel?.postMessage(jobID);
+        try {
+            if (job.background_fetch_id !== null && 'serviceWorker' in navigator) {
+                const registration = await navigator.serviceWorker.getRegistration();
+                const backgroundFetch = await registration?.backgroundFetch?.get(job.background_fetch_id);
+                await backgroundFetch?.abort();
+            }
+        } finally {
+            await OfflineVideoStorage.deleteGeneration(job.video_id, job.generation_id);
         }
-        await OfflineVideoStorage.deleteGeneration(job.video_id, job.generation_id);
     }
 
     /**
@@ -950,7 +1401,7 @@ export default class OfflineVideos {
      * 前景保存中のページ凍結を抑えるローカル WebRTC 接続を開始する。
      * @returns WebRTC 接続を閉じる関数（利用できない環境では null）
      */
-    private static async acquireForegroundActivityProtection(): Promise<(() => void) | null> {
+    private static async acquireForegroundActivityProtection(signal: AbortSignal): Promise<(() => void) | null> {
 
         if ('RTCPeerConnection' in window === false) return null;
 
@@ -958,21 +1409,34 @@ export default class OfflineVideos {
         const answerPeerConnection = new RTCPeerConnection({iceServers: []});
         const offerDataChannel = offerPeerConnection.createDataChannel('konomitv-offline-download');
         const dataChannels = [offerDataChannel];
+        const closeConnections = () => {
+            dataChannels.forEach(dataChannel => dataChannel.close());
+            offerPeerConnection.close();
+            answerPeerConnection.close();
+        };
+        signal.addEventListener('abort', closeConnections, {once: true});
 
         /** ICE 候補を SDP に集約し、外部の STUN サーバーなしでローカル接続を確立できるまで待つ */
         const waitForICEGathering = async (peerConnection: RTCPeerConnection): Promise<void> => {
             if (peerConnection.iceGatheringState === 'complete') return;
             await new Promise<void>((resolve, reject) => {
-                const timeoutID = window.setTimeout(() => {
-                    peerConnection.removeEventListener('icegatheringstatechange', onICEGatheringStateChange);
-                    reject(new Error('WebRTC のローカル接続準備がタイムアウトしました。'));
-                }, 5_000);
-                const onICEGatheringStateChange = (): void => {
-                    if (peerConnection.iceGatheringState !== 'complete') return;
+                const finish = (error?: unknown) => {
                     window.clearTimeout(timeoutID);
                     peerConnection.removeEventListener('icegatheringstatechange', onICEGatheringStateChange);
-                    resolve();
+                    signal.removeEventListener('abort', onAbort);
+                    if (error === undefined) resolve();
+                    else reject(error);
                 };
+                const timeoutID = window.setTimeout(() => finish(new Error('WebRTC のローカル接続準備がタイムアウトしました。')), 5_000);
+                const onAbort = () => finish(signal.reason);
+                const onICEGatheringStateChange = (): void => {
+                    if (peerConnection.iceGatheringState === 'complete') finish();
+                };
+                if (signal.aborted) {
+                    onAbort();
+                    return;
+                }
+                signal.addEventListener('abort', onAbort, {once: true});
                 peerConnection.addEventListener('icegatheringstatechange', onICEGatheringStateChange);
             });
         };
@@ -1001,26 +1465,31 @@ export default class OfflineVideos {
             // Chrome が保護対象と判定するのは開いた DataChannel なので、接続完了後に動画転送へ進む
             if (offerDataChannel.readyState !== 'open') {
                 await new Promise<void>((resolve, reject) => {
-                    const timeoutID = window.setTimeout(() => {
-                        reject(new Error('WebRTC のローカル接続がタイムアウトしました。'));
-                    }, 5_000);
-                    offerDataChannel.addEventListener('open', () => {
+                    const finish = (error?: unknown) => {
                         window.clearTimeout(timeoutID);
-                        resolve();
-                    }, {once: true});
+                        offerDataChannel.removeEventListener('open', onOpen);
+                        signal.removeEventListener('abort', onAbort);
+                        if (error === undefined) resolve();
+                        else reject(error);
+                    };
+                    const timeoutID = window.setTimeout(() => finish(new Error('WebRTC のローカル接続がタイムアウトしました。')), 5_000);
+                    const onAbort = () => finish(signal.reason);
+                    const onOpen = () => finish();
+                    if (signal.aborted) {
+                        onAbort();
+                        return;
+                    }
+                    signal.addEventListener('abort', onAbort, {once: true});
+                    offerDataChannel.addEventListener('open', onOpen, {once: true});
                 });
             }
 
-            return () => {
-                dataChannels.forEach(dataChannel => dataChannel.close());
-                offerPeerConnection.close();
-                answerPeerConnection.close();
-            };
+            return closeConnections;
         } catch (error) {
-            dataChannels.forEach(dataChannel => dataChannel.close());
-            offerPeerConnection.close();
-            answerPeerConnection.close();
+            closeConnections();
             throw error;
+        } finally {
+            signal.removeEventListener('abort', closeConnections);
         }
     }
 

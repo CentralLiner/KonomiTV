@@ -66,12 +66,15 @@
                 </div>
             </div>
             <div class="recorded-program-list__grid-content">
-                <RecordedProgram v-for="program in displayPrograms" :key="program.id" :program="program"
+                <RecordedProgram v-for="{program, job} in displayProgramEntries" :key="program.id" :program="program"
                     :forMylist="forMylist" :forWatchedHistory="forWatchedHistory" :forOffline="forOffline"
                     :offlineVideo="offlineVideos?.find(video => video.video_id === program.id) ?? null"
-                    :offlineDownloadJob="getOfflineDownloadJob(program.id)"
+                    :offlineDownloadJob="job"
+                    :isOfflineJobReconnecting="job !== null && reconnectingOfflineJobIDs?.has(job.job_id)"
+                    :isRetryingOfflineJob="job !== null && retryingOfflineJobIDs?.has(job.job_id)"
                     @deleted="handleProgramDeleted"
                     @cancelOfflineJob="jobID => $emit('cancelOfflineJob', jobID)"
+                    @retryOfflineJob="jobID => $emit('retryOfflineJob', jobID)"
                     @dismissOfflineJob="jobID => $emit('dismissOfflineJob', jobID)" />
             </div>
         </div>
@@ -89,7 +92,7 @@
 </template>
 <script lang="ts" setup>
 
-import { ref, watch } from 'vue';
+import { computed, ref, watch } from 'vue';
 import { useRouter } from 'vue-router';
 
 import type { IOfflineDownloadJob, IOfflineVideo } from '@/services/OfflineVideos';
@@ -123,6 +126,8 @@ const props = withDefaults(defineProps<{
     forOffline?: boolean;
     offlineVideos?: IOfflineVideo[];
     offlineJobs?: IOfflineDownloadJob[];
+    reconnectingOfflineJobIDs?: ReadonlySet<string>;
+    retryingOfflineJobIDs?: ReadonlySet<string>;
 }>(), {
     page: 1,
     sortOrder: 'desc',
@@ -150,6 +155,7 @@ defineEmits<{
     (e: 'update:sortOrder', order: SortOrder | MylistSortOrder): void;
     (e: 'more'): void;
     (e: 'cancelOfflineJob', jobID: string): void;
+    (e: 'retryOfflineJob', jobID: string): void;
     (e: 'dismissOfflineJob', jobID: string): void;
 }>();
 
@@ -198,6 +204,11 @@ const getOfflineDownloadJob = (videoID: number): IOfflineDownloadJob | null => {
         job.video_id === videoID && ['Waiting', 'Downloading', 'Finalizing', 'Failed'].includes(job.state),
     ) ?? null;
 };
+
+const displayProgramEntries = computed(() => displayPrograms.value.map(program => ({
+    program,
+    job: getOfflineDownloadJob(program.id),
+})));
 
 </script>
 <style lang="scss" scoped>

@@ -14,9 +14,10 @@
                         :total="displayTotal" :hideSort="true" :hidePagination="true" :showBackButton="true"
                         :showEmptyMessage="isLoading === false" :isLoading="isLoading" :forOffline="true"
                         :offlineVideos="videos" :offlineJobs="visibleOfflineJobs"
+                        :reconnectingOfflineJobIDs="reconnectingJobIDs" :retryingOfflineJobIDs="retryingJobIDs"
                         emptyIcon="fluent:cloud-off-24-regular" emptyMessage="オフライン保存した番組はありません。"
                         emptySubMessage="録画番組のメニューまたは視聴画面から保存できます。"
-                        @cancelOfflineJob="cancelJob" @dismissOfflineJob="dismissJob">
+                        @cancelOfflineJob="cancelJob" @retryOfflineJob="retryJob" @dismissOfflineJob="dismissJob">
                         <template #after-header>
                             <section class="offline-videos-storage">
                                 <div class="offline-videos-storage__item">
@@ -71,7 +72,10 @@ const jobs = ref<IOfflineDownloadJob[]>([]);
 const storageUsageBytes = ref(0);
 const storageQuotaBytes = ref(0);
 const isLoading = ref(true);
+const reconnectingJobIDs = ref(new Set<string>());
+const retryingJobIDs = ref(new Set<string>());
 let isRefreshing = false;
+let needsRefresh = false;
 
 const activeJobs = computed(() => jobs.value.filter(job => ['Waiting', 'Downloading', 'Finalizing'].includes(job.state)));
 const visibleOfflineJobs = computed(() => jobs.value.filter(job =>
@@ -140,7 +144,7 @@ const refreshActiveJobProgress = async (): Promise<void> => {
             }
 
             // 非同期取得の途中で Waiting を画面へ反映せず、受信量と状態を確定してからまとめて更新する
-            let nextDownloadedBytes = Math.max(job.downloaded_bytes, latestJob.downloaded_bytes);
+            let nextDownloadedBytes = latestJob.downloaded_bytes;
             let nextState = latestJob.state;
 
             // Background Fetch 中はブラウザ側の受信量の方が進んでいることが多い
@@ -171,7 +175,10 @@ const refreshActiveJobProgress = async (): Promise<void> => {
 
 /** 保存済み動画、保存ジョブ、ブラウザ容量を IndexedDB と Storage API から読み直す */
 const refresh = async (): Promise<void> => {
-    if (isRefreshing === true) return;
+    if (isRefreshing === true) {
+        needsRefresh = true;
+        return;
+    }
     isRefreshing = true;
     try {
         const nextVideos = await OfflineVideos.getVideos();
@@ -182,6 +189,7 @@ const refresh = async (): Promise<void> => {
 
         videos.value = nextVideos;
         jobs.value = nextJobs;
+        reconnectingJobIDs.value = new Set(nextJobs.filter(job => OfflineVideos.isReconnecting(job.job_id)).map(job => job.job_id));
         const storageEstimate = await navigator.storage.estimate();
         storageUsageBytes.value = storageEstimate.usage ?? 0;
         storageQuotaBytes.value = storageEstimate.quota ?? 0;
@@ -191,6 +199,10 @@ const refresh = async (): Promise<void> => {
     } finally {
         isLoading.value = false;
         isRefreshing = false;
+        if (needsRefresh) {
+            needsRefresh = false;
+            void refresh();
+        }
     }
 };
 
@@ -212,6 +224,19 @@ const dismissJob = async (jobID: string): Promise<void> => {
     } catch (error) {
         Message.error(error instanceof Error ? error.message : '失敗した保存ジョブを削除できませんでした。');
     } finally {
+        await refresh();
+    }
+};
+
+const retryJob = async (jobID: string): Promise<void> => {
+    if (retryingJobIDs.value.has(jobID)) return;
+    retryingJobIDs.value.add(jobID);
+    try {
+        await OfflineVideos.retry(jobID);
+    } catch (error) {
+        Message.error(error instanceof Error ? error.message : 'オフライン保存をやり直せませんでした。');
+    } finally {
+        retryingJobIDs.value.delete(jobID);
         await refresh();
     }
 };

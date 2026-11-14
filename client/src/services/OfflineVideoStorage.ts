@@ -90,10 +90,19 @@ export default class OfflineVideoStorage {
     }
 
     /** 同じ録画番組の実行中ジョブがなければ、新しいジョブを追加する */
-    static async putJobIfVideoIdle(job: IOfflineDownloadJob): Promise<void> {
+    static async putJobIfVideoIdle(job: IOfflineDownloadJob, retryJobID?: string): Promise<void> {
         const database = await this.openDatabase();
         const transaction = database.transaction(this.JOB_STORE_NAME, 'readwrite');
         const jobs = await transaction.store.getAll();
+
+        if (retryJobID !== undefined) {
+            const retryJob = jobs.find(existingJob => existingJob.job_id === retryJobID);
+            if (retryJob?.state !== 'Failed' || retryJob.video_id !== job.video_id || retryJob.quality !== job.quality ||
+                (retryJob.background_fetch_id === null) !== (job.background_fetch_id === null)) {
+                await transaction.done;
+                throw new Error('やり直す保存が見つかりませんでした。');
+            }
+        }
 
         // 検査と追加を同じトランザクションへ入れ、別タブ同士の保存開始を直列化する
         if (jobs.some(existingJob => existingJob.video_id === job.video_id &&
@@ -190,10 +199,15 @@ export default class OfflineVideoStorage {
         this.eventTarget.dispatchEvent(new Event('change'));
     }
 
-    /** 終端状態の保存ジョブを IndexedDB から削除する */
+    /** 指定した失敗ジョブを一覧から削除する */
     static async deleteJob(jobID: string): Promise<void> {
         const database = await this.openDatabase();
-        await database.delete(this.JOB_STORE_NAME, jobID);
+        const transaction = database.transaction(this.JOB_STORE_NAME, 'readwrite');
+        const job = await transaction.store.get(jobID);
+        if (job?.state === 'Failed') {
+            await transaction.store.delete(jobID);
+        }
+        await transaction.done;
         this.eventTarget.dispatchEvent(new Event('change'));
     }
 
