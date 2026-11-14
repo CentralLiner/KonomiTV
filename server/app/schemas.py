@@ -252,6 +252,20 @@ class OfflineVideoStreamMetadata(BaseModel):
     # 保存容量の見積もりとプレイリスト生成に使う録画時間
     duration_seconds: float
 
+class OfflineVideoSessionInfo(OfflineVideoStreamMetadata):
+    protocol_version: Literal[2] = 2
+    generation_token: str
+    lease_timeout_seconds: int
+    max_segment_bytes: int
+
+class OfflineVideoSessionStreamMetadata(OfflineVideoSessionInfo):
+    session_id: str
+    next_sequence: int
+
+class OfflineVideoCheckpoint(BaseModel):
+    next_sequence: int = Field(ge=0, le=0xfffffffe, strict=True)
+    connection_id: int = Field(ge=1, le=2**53 - 1, strict=True)
+
 # ***** シリーズ *****
 
 class Series(PydanticModel):

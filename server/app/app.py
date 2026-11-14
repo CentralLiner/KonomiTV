@@ -44,6 +44,7 @@ from app.routers import (
     VideoStreamsRouter,
 )
 from app.streams.LiveStream import LiveStream
+from app.streams.OfflineVideoSession import OfflineVideoSession
 from app.utils.edcb.EDCBTuner import EDCBTuner
 from app.utils.FastAPITaskUtil import repeat_every
 
@@ -98,7 +99,7 @@ app.add_middleware(
     allow_methods = ['*'],
     allow_headers = ['*'],
     # 録画 TS の直接再生でクライアントが Range 応答の開始位置と総ファイルサイズを検証するため必要なヘッダーを許可
-    expose_headers = ['Accept-Ranges', 'Content-Length', 'Content-Range', 'ETag', 'Last-Modified'],
+    expose_headers = ['Accept-Ranges', 'Content-Length', 'Content-Range', 'ETag', 'Last-Modified', 'Retry-After'],
     allow_credentials = True,
 )
 
@@ -290,6 +291,8 @@ async def Shutdown():
     # 全てのライブストリームを終了する
     for live_stream in LiveStream.getAllLiveStreams():
         live_stream.setStatus('Offline', 'ライブストリームは Offline です。', True)
+
+    await OfflineVideoSession.closeAll()
 
     # 全てのチューナーインスタンスを終了する (EDCB バックエンドのみ)
     if CONFIG.general.backend == 'EDCB':
