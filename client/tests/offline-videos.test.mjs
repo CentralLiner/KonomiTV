@@ -146,6 +146,20 @@ function downloadFixture({interruptFirstResponse = false, failStorage = null, re
     };
 }
 
+for (const failure of ['HTTP', 'CacheStorage']) {
+    test(`付随画像の${failure}エラーで未読の本文を中止し、ジョブは中止しない`, async () => {
+        let bodyCancelled = false;
+        const fixture = downloadFixture({respond: async () => new Response(new ReadableStream({
+            cancel() { bodyCancelled = true; },
+        }), {status: failure === 'HTTP' ? 503 : 200})});
+        const controller = new AbortController();
+        const cache = {put: async () => { throw new DOMException('CacheStorage is full', 'QuotaExceededError'); }};
+        await fixture.service.cacheOptionalAsset(cache, 'https://konomitv.test/image', '/image', controller.signal);
+        assert.equal(bodyCancelled, true);
+        assert.equal(controller.signal.aborted, false);
+    });
+}
+
 for (const useBackgroundFetch of [false, true]) {
     const mode = useBackgroundFetch ? 'Background Fetch' : '通常 Fetch';
     for (const waitingFor of ['ヘッダー', '本文']) {

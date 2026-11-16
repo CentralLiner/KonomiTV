@@ -444,10 +444,9 @@ export default class OfflineVideos {
     }
 
     private static async cacheOptionalAsset(cache: Cache, source: string, destination: string, signal: AbortSignal): Promise<void> {
-        const request = new Request(source);
-        const {controller, dispose} = this.linkAbortController(signal);
+        let response: Response | undefined;
         try {
-            const response = await fetch(request, {signal: controller.signal});
+            response = await fetch(source, {signal});
             if (!response.ok) {
                 console.warn('[OfflineVideos] Optional offline asset returned HTTP', response.status);
                 return;
@@ -467,8 +466,10 @@ export default class OfflineVideos {
             }
             throw error;
         } finally {
-            controller.abort();
-            dispose();
+            // HTTP エラーや書き込み開始前の失敗では、未読の本文のダウンロードを残さない。
+            if (response !== undefined && !response.bodyUsed && !signal.aborted) {
+                await response.body?.cancel();
+            }
         }
     }
 
