@@ -195,7 +195,14 @@ export default class OfflineVideoStorage {
     static async deleteVideo(video: IOfflineVideo): Promise<void> {
         await this.deleteGeneration(video.video_id, video.generation_id);
         const database = await this.openDatabase();
-        await database.delete(this.VIDEO_STORE_NAME, video.video_id);
+        const transaction = database.transaction(this.VIDEO_STORE_NAME, 'readwrite');
+        const currentVideo = await transaction.store.get(video.video_id);
+
+        // キャッシュの削除中に再保存が完了した場合は、新しい保存世代を保持する。
+        if (currentVideo?.generation_id === video.generation_id) {
+            await transaction.store.delete(video.video_id);
+        }
+        await transaction.done;
         this.eventTarget.dispatchEvent(new Event('change'));
     }
 

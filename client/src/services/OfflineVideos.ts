@@ -420,14 +420,60 @@ export default class OfflineVideos {
         }
 
         const {controller, dispose} = this.linkAbortController(signal);
+        const assetSignal = controller.signal;
+        // 任意の画像は HTTP と保存領域の失敗をログに残し、動画の保存を続ける。
+        const cacheOptionalAsset = async (source: string, destination: string): Promise<void> => {
+            const request = new Request(source, {signal: assetSignal});
+            const response = await fetch(request).catch((error: unknown) => {
+                assetSignal.throwIfAborted();
+                if (error instanceof TypeError || (error instanceof DOMException && error.name === 'NetworkError')) {
+                    console.warn('[OfflineVideos] Failed to download an optional offline asset:', error);
+                    return null;
+                }
+                throw error;
+            });
+            if (response === null) return;
+
+            try {
+                // エラーレスポンスと CacheStorage に保存できない HTTP レスポンスは、画像の取得失敗として扱う。
+                const vary = response.headers.get('Vary');
+                if (!response.ok || response.status === 206 || vary?.split(',').some(value => value.trim() === '*')) {
+                    console.warn('[OfflineVideos] Optional offline asset returned an uncacheable response.', response.status);
+                    return;
+                }
+
+                // cache.put() が本文を読み切るまで、ジョブのキャンセルを Fetch に伝える。
+                const hasUnreadBody = !response.bodyUsed && response.body?.locked !== true;
+                try {
+                    await cache.put(destination, response);
+                } catch (error) {
+                    assetSignal.throwIfAborted();
+                    const isStorageError = error instanceof DOMException &&
+                        ['QuotaExceededError', 'NetworkError', 'UnknownError', 'AbortError'].includes(error.name);
+                    // 未使用の本文を読み始めた後の TypeError は、本文の通信・デコード失敗として扱う。
+                    const isBodyReadError = error instanceof TypeError && hasUnreadBody && response.bodyUsed;
+                    if (!isStorageError && !isBodyReadError) throw error;
+                    console.warn('[OfflineVideos] Failed to cache an optional offline asset:', error);
+                }
+            } finally {
+                // HTTP エラーや書き込み開始前の失敗では、未読の本文のダウンロードを残さない。
+                if (!response.bodyUsed && !response.body?.locked && !assetSignal.aborted) {
+                    await response.body?.cancel().catch((error: unknown) => {
+                        assetSignal.throwIfAborted();
+                        console.warn('[OfflineVideos] Failed to cancel an optional offline asset response body:', error);
+                    });
+                }
+            }
+        };
+
         try {
             // 準備を続けられない例外では残りの画像取得を中断し、世代回収の前に書き込みの終了を待つ。
             await Promise.all(assets.map(asset =>
-                this.cacheOptionalAsset(cache, asset.source, `${baseURL}/assets/${asset.name}`, controller.signal)
+                cacheOptionalAsset(asset.source, `${baseURL}/assets/${asset.name}`)
                     .catch((error: unknown) => controller.abort(error)),
             ));
             signal.throwIfAborted();
-            controller.signal.throwIfAborted();
+            assetSignal.throwIfAborted();
         } finally {
             dispose();
         }
@@ -458,50 +504,6 @@ export default class OfflineVideos {
         });
     }
 
-    private static async cacheOptionalAsset(cache: Cache, source: string, destination: string, signal: AbortSignal): Promise<void> {
-        const request = new Request(source, {signal});
-        const response = await fetch(request).catch((error: unknown) => {
-            signal.throwIfAborted();
-            if (error instanceof TypeError || (error instanceof DOMException && error.name === 'NetworkError')) {
-                console.warn('[OfflineVideos] Failed to download an optional offline asset:', error);
-                return null;
-            }
-            throw error;
-        });
-        if (response === null) return;
-
-        try {
-            // エラーレスポンスと CacheStorage に保存できない HTTP レスポンスは、画像の取得失敗として扱う。
-            const vary = response.headers.get('Vary');
-            if (!response.ok || response.status === 206 || vary?.split(',').some(value => value.trim() === '*')) {
-                console.warn('[OfflineVideos] Optional offline asset returned an uncacheable response.', response.status);
-                return;
-            }
-
-            // cache.put() が本文を読み切るまで、ジョブのキャンセルを Fetch に伝える。
-            const hasUnreadBody = !response.bodyUsed && response.body?.locked !== true;
-            try {
-                await cache.put(destination, response);
-            } catch (error) {
-                signal.throwIfAborted();
-                const isStorageError = error instanceof DOMException &&
-                    ['QuotaExceededError', 'NetworkError', 'UnknownError', 'AbortError'].includes(error.name);
-                // 未使用の本文を読み始めた後の TypeError は、本文の通信・デコード失敗として扱う。
-                const isBodyReadError = error instanceof TypeError && hasUnreadBody && response.bodyUsed;
-                if (!isStorageError && !isBodyReadError) throw error;
-                console.warn('[OfflineVideos] Failed to cache an optional offline asset:', error);
-            }
-        } finally {
-            // HTTP エラーや書き込み開始前の失敗では、未読の本文のダウンロードを残さない。
-            if (!response.bodyUsed && !response.body?.locked && !signal.aborted) {
-                await response.body?.cancel().catch((error: unknown) => {
-                    signal.throwIfAborted();
-                    console.warn('[OfflineVideos] Failed to cancel an optional offline asset response body:', error);
-                });
-            }
-        }
-    }
-
     private static async runForegroundDownload(
         job: IOfflineDownloadJob,
         controller: AbortController,
@@ -515,6 +517,50 @@ export default class OfflineVideos {
         let sessionInfo: IOfflineVideoSessionInfo | undefined;
         let wakeLock: WakeLockSentinel | undefined;
         let releaseActivity: (() => void) | null = null;
+
+        // 作成応答を取得するまで、同じ ID で作成を再試行する。
+        const createSession = async (): Promise<IOfflineVideoSessionInfo> => {
+            let retryCount = 0;
+            let retryDeadline = 0;
+            while (true) {
+                signal.throwIfAborted();
+                if (retryCount > 0 && performance.now() >= retryDeadline) {
+                    throw new Error('オフライン保存の接続を開始できませんでした。');
+                }
+                const {controller: requestController, dispose} = this.linkAbortController(signal);
+                const timeout = setTimeout(() => requestController.abort(), 30_000);
+                let retryError: OfflineDownloadNetworkError;
+                try {
+                    const response = await this.fetchResponse(url, {method: 'PUT', signal: requestController.signal});
+                    await this.checkSessionResponse(response, requestController.signal);
+                    if (response.status !== 201 && response.status !== 200) {
+                        throw new Error('オフライン保存の開始応答が不正です。');
+                    }
+                    const info: unknown = await this.readSessionJSON(response, requestController.signal);
+                    if (!this.isSessionInfo(info)) {
+                        throw new Error('オフライン保存の開始応答が不正です。');
+                    }
+                    return info;
+                } catch (error) {
+                    signal.throwIfAborted();
+                    if (error instanceof OfflineDownloadNetworkError === false) throw error;
+                    retryError = error;
+                } finally {
+                    clearTimeout(timeout);
+                    requestController.abort();
+                    dispose();
+                }
+                if (retryError.status === 429) {
+                    await this.waitForDelay(Math.max(5000, retryError.retryAfterMilliseconds), signal);
+                    retryCount = 0;
+                    continue;
+                }
+                if (retryCount === 0) retryDeadline = performance.now() + this.RECONNECT_BUDGET;
+                await this.waitToReconnect(retryError, retryCount, retryDeadline, signal);
+                retryCount++;
+            }
+        };
+
         try {
             // 前景保存中だけ、画面の消灯とバックグラウンドでのページ凍結を抑える。
             if ('wakeLock' in navigator) {
@@ -531,14 +577,59 @@ export default class OfflineVideos {
                 signal.throwIfAborted();
                 console.warn('[OfflineVideos] Failed to acquire foreground activity protection:', error);
             }
-            sessionInfo = await this.createSession(url, signal);
+            const info = await createSession();
+            sessionInfo = info;
             signal.throwIfAborted();
-            if (!this.matchesJob(sessionInfo, job)) {
+            if (!this.matchesJob(info, job)) {
                 throw new Error('オフライン保存の開始応答が録画番組や画質と一致しません。');
             }
 
             const cache = await OfflineVideoStorage.openCache();
             const progress: IOfflineDownloadProgress = {segmentDurations: [], sizeBytes: 0};
+
+            // ACK と生存通知は接続単位で送信し、本文の読み取りと並行して進める。
+            const sendCheckpoints = async (connectionID: number, checkpointSignal: AbortSignal): Promise<void> => {
+                let lastSentAt = performance.now();
+                let lastAcknowledged = progress.segmentDurations.length;
+                while (true) {
+                    await this.waitForDelay(1000, checkpointSignal);
+                    const nextSequence = progress.segmentDurations.length;
+                    const interval = nextSequence > lastAcknowledged ? 3000 : 10_000;
+                    if (performance.now() - lastSentAt < interval) continue;
+
+                    // 同じ位置でも生存通知を送る。通信に失敗したときは最新の位置を次回送信する。
+                    lastSentAt = performance.now();
+                    const {controller: requestController, dispose} = this.linkAbortController(checkpointSignal);
+                    const timeout = setTimeout(() => requestController.abort(), 10_000);
+                    try {
+                        const response = await this.fetchResponse(`${url}/checkpoint`, {
+                            method: 'PUT',
+                            headers: {
+                                'Content-Type': 'application/json',
+                                'X-KonomiTV-Offline-Generation': info.generation_token,
+                            },
+                            body: JSON.stringify({connection_id: connectionID, next_sequence: nextSequence}),
+                            signal: requestController.signal,
+                        });
+                        await this.checkSessionResponse(response, requestController.signal);
+                        const result = await this.readSessionJSON(response, requestController.signal) as {connection_id?: number; next_sequence?: number} | null;
+                        if (result?.connection_id !== connectionID || typeof result.next_sequence !== 'number' ||
+                            !Number.isInteger(result.next_sequence) || result.next_sequence < nextSequence ||
+                            result.next_sequence > progress.segmentDurations.length) {
+                            throw new Error('オフライン保存の進捗確認に失敗しました。');
+                        }
+                        lastAcknowledged = result.next_sequence;
+                    } catch (error) {
+                        checkpointSignal.throwIfAborted();
+                        if (error instanceof OfflineDownloadNetworkError === false) throw error;
+                    } finally {
+                        clearTimeout(timeout);
+                        requestController.abort();
+                        dispose();
+                    }
+                }
+            };
+
             let connectionID = 0;
             let reconnectCount = 0;
             let reconnectDeadline = 0;
@@ -561,7 +652,7 @@ export default class OfflineVideos {
                     let response: Response;
                     try {
                         response = await this.fetchResponse(`${url}?next_sequence=${nextSequence}&connection_id=${connectionID}`, {
-                            headers: {'X-KonomiTV-Offline-Generation': sessionInfo.generation_token},
+                            headers: {'X-KonomiTV-Offline-Generation': info.generation_token},
                             signal: connectionSignal,
                         });
                         connectionSignal.throwIfAborted();
@@ -574,7 +665,7 @@ export default class OfflineVideos {
                     }
                     job.state = 'Downloading';
                     await this.updateJob(job);
-                    checkpointTask = this.sendCheckpoints(url, sessionInfo, connectionID, progress, connectionSignal)
+                    checkpointTask = sendCheckpoints(connectionID, connectionSignal)
                         .catch((error: unknown) => {
                             if (connectionSignal.aborted === false) {
                                 checkpointError = error;
@@ -583,7 +674,7 @@ export default class OfflineVideos {
                         });
                     const metadata = await this.receiveSegments(job, response, cache, progress, {
                         sessionID,
-                        info: sessionInfo,
+                        info,
                         controller: connection.controller,
                     });
                     connection.controller.abort();
@@ -617,8 +708,11 @@ export default class OfflineVideos {
                 reconnectCount++;
             }
         } catch (error) {
+            // 失敗時は動画と並行で受信している実況データも中断する。
+            const wasCancelled = signal.aborted;
+            controller.abort();
             try {
-                if (signal.aborted) {
+                if (wasCancelled) {
                     await OfflineVideoStorage.transitionActiveJobToTerminalState(job.job_id, 'Cancelled', null);
                 } else {
                     console.error('[OfflineVideos] Foreground offline download failed:', error);
@@ -655,96 +749,6 @@ export default class OfflineVideos {
                     clearTimeout(timeout);
                     cleanupController.abort();
                 }
-            }
-        }
-    }
-
-    private static async createSession(url: string, signal: AbortSignal): Promise<IOfflineVideoSessionInfo> {
-        let retryCount = 0;
-        let retryDeadline = 0;
-        while (true) {
-            signal.throwIfAborted();
-            if (retryCount > 0 && performance.now() >= retryDeadline) {
-                throw new Error('オフライン保存の接続を開始できませんでした。');
-            }
-            const {controller, dispose} = this.linkAbortController(signal);
-            const timeout = setTimeout(() => controller.abort(), 30_000);
-            let retryError: OfflineDownloadNetworkError;
-            try {
-                const response = await this.fetchResponse(url, {method: 'PUT', signal: controller.signal});
-                await this.checkSessionResponse(response, controller.signal);
-                if (response.status !== 201 && response.status !== 200) {
-                    throw new Error('オフライン保存の開始応答が不正です。');
-                }
-                const info: unknown = await this.readSessionJSON(response, controller.signal);
-                if (!this.isSessionInfo(info)) {
-                    throw new Error('オフライン保存の開始応答が不正です。');
-                }
-                return info;
-            } catch (error) {
-                signal.throwIfAborted();
-                if (error instanceof OfflineDownloadNetworkError === false) throw error;
-                retryError = error;
-            } finally {
-                clearTimeout(timeout);
-                controller.abort();
-                dispose();
-            }
-            if (retryError.status === 429) {
-                await this.waitForDelay(Math.max(5000, retryError.retryAfterMilliseconds), signal);
-                retryCount = 0;
-                continue;
-            }
-            if (retryCount === 0) retryDeadline = performance.now() + this.RECONNECT_BUDGET;
-            await this.waitToReconnect(retryError, retryCount, retryDeadline, signal);
-            retryCount++;
-        }
-    }
-
-    private static async sendCheckpoints(
-        url: string,
-        info: IOfflineVideoSessionInfo,
-        connectionID: number,
-        progress: IOfflineDownloadProgress,
-        signal: AbortSignal,
-    ): Promise<void> {
-        let lastSentAt = performance.now();
-        let lastAcknowledged = progress.segmentDurations.length;
-        while (true) {
-            await this.waitForDelay(1000, signal);
-            const nextSequence = progress.segmentDurations.length;
-            const interval = nextSequence > lastAcknowledged ? 3000 : 10_000;
-            if (performance.now() - lastSentAt < interval) continue;
-
-            // 同じ位置でも生存通知を送る。通信に失敗したときは最新の位置を次回送信する。
-            lastSentAt = performance.now();
-            const {controller, dispose} = this.linkAbortController(signal);
-            const timeout = setTimeout(() => controller.abort(), 10_000);
-            try {
-                const response = await this.fetchResponse(`${url}/checkpoint`, {
-                    method: 'PUT',
-                    headers: {
-                        'Content-Type': 'application/json',
-                        'X-KonomiTV-Offline-Generation': info.generation_token,
-                    },
-                    body: JSON.stringify({connection_id: connectionID, next_sequence: nextSequence}),
-                    signal: controller.signal,
-                });
-                await this.checkSessionResponse(response, controller.signal);
-                const result = await this.readSessionJSON(response, controller.signal) as {connection_id?: number; next_sequence?: number} | null;
-                if (result?.connection_id !== connectionID || typeof result.next_sequence !== 'number' ||
-                    !Number.isInteger(result.next_sequence) || result.next_sequence < nextSequence ||
-                    result.next_sequence > progress.segmentDurations.length) {
-                    throw new Error('オフライン保存の進捗確認に失敗しました。');
-                }
-                lastAcknowledged = result.next_sequence;
-            } catch (error) {
-                signal.throwIfAborted();
-                if (error instanceof OfflineDownloadNetworkError === false) throw error;
-            } finally {
-                clearTimeout(timeout);
-                controller.abort();
-                dispose();
             }
         }
     }
@@ -1389,12 +1393,9 @@ export default class OfflineVideos {
 
     /**
      * 保存済み動画を端末から削除する。
-     * @param videoID 録画番組 ID
+     * @param video 削除操作で選択された保存済み動画
      */
-    static async deleteVideo(videoID: number): Promise<void> {
-
-        const video = await this.getVideo(videoID);
-        if (video === null) return;
+    static async deleteVideo(video: IOfflineVideo): Promise<void> {
         await OfflineVideoStorage.deleteVideo(video);
     }
 

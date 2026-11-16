@@ -1,6 +1,6 @@
 <template>
-    <component :is="rootTag" v-ripple class="recorded-program"
-        v-bind="rootBindings"
+    <component :is="hasOfflineJobActions ? 'div' : programTag" v-ripple class="recorded-program"
+        v-bind="hasOfflineJobActions ? {} : programLinkProps"
         :class="{
             'recorded-program--recording': program.recorded_video.status === 'Recording',
             'recorded-program--failed': program.recorded_video.status === 'AnalysisFailed',
@@ -8,7 +8,8 @@
             'recorded-program--offline-blocked': isOfflineInteractionBlocked,
             'recorded-program--offline-job-failed': isOfflineJobFailed,
         }">
-        <div class="recorded-program__container">
+        <component :is="hasOfflineJobActions ? programTag : 'div'" class="recorded-program__container"
+            v-bind="hasOfflineJobActions ? programLinkProps : {}">
             <div class="recorded-program__thumbnail">
                 <img class="recorded-program__thumbnail-image" loading="lazy" decoding="async"
                     :src="offlineThumbnailURL" @error="onOfflineThumbnailError">
@@ -182,8 +183,8 @@
                     </v-list>
                 </v-menu>
             </div>
-        </div>
-        <div v-if="forOffline && isOfflineJobFailed" class="recorded-program__offline-actions">
+        </component>
+        <div v-if="hasOfflineJobActions" class="recorded-program__offline-actions">
             <v-btn color="secondary" variant="tonal" size="small" :loading="isRetryingOfflineJob"
                 @click.prevent.stop="retryOfflineDownload">
                 <Icon icon="fluent:arrow-clockwise-16-regular" width="16px" height="16px" />
@@ -228,7 +229,7 @@
     </v-dialog>
 
     <!-- オフライン保存削除確認ダイアログ -->
-    <v-dialog v-model="showOfflineDeleteConfirmation" max-width="715">
+    <v-dialog v-if="offlineVideoToDelete !== null" v-model="showOfflineDeleteConfirmation" max-width="715">
         <v-card>
             <v-card-title class="d-flex justify-center pt-6 font-weight-bold">
                 オフライン保存を削除しますか？
@@ -236,9 +237,9 @@
             <v-card-text class="pt-2 pb-0">
                 <div class="mb-4">
                     <div class="text-h6 text-text mb-2"
-                        v-html="ProgramUtils.decorateProgramInfo(program, 'title')"></div>
+                        v-html="ProgramUtils.decorateProgramInfo(offlineVideoToDelete.program, 'title')"></div>
                     <div class="text-body-2 text-text-darken-1">
-                        {{ProgramUtils.getProgramTime(program)}}
+                        {{ProgramUtils.getProgramTime(offlineVideoToDelete.program)}}
                     </div>
                 </div>
                 <v-alert color="info" variant="tonal">
@@ -336,6 +337,8 @@ const showOfflineJobDismissConfirmation = ref(false);
 const offlineJobToDismiss = ref<IOfflineDownloadJob | null>(null);
 // オフライン保存削除確認ダイアログの表示状態
 const showOfflineDeleteConfirmation = ref(false);
+// 削除確認を開いた時点の保存世代を操作対象にする。
+const offlineVideoToDelete = ref<IOfflineVideo | null>(null);
 // オフライン保存の削除中は確定ボタンの二重操作を防ぐ
 const isDeletingOfflineVideo = ref(false);
 
@@ -430,6 +433,8 @@ const isOfflineJobActive = computed(() => {
 
 // 失敗した保存ジョブかどうか
 const isOfflineJobFailed = computed(() => props.offlineDownloadJob?.state === 'Failed');
+// 再試行・削除の操作がある行では、再生リンクを番組の行だけに付ける
+const hasOfflineJobActions = computed(() => props.forOffline && isOfflineJobFailed.value);
 
 // 保存済みデータがなく、保存ジョブだけが存在する場合は再生リンクを無効化する
 const isOfflineInteractionBlocked = computed(() => {
@@ -438,12 +443,11 @@ const isOfflineInteractionBlocked = computed(() => {
     return isOfflineJobActive.value === true || isOfflineJobFailed.value === true;
 });
 
-// オフライン保存ページのルート要素 (保存ジョブ実行中は div へ切り替える)
-const rootTag = computed(() => isOfflineInteractionBlocked.value === true ? 'div' : 'router-link');
+const programTag = computed(() => isOfflineInteractionBlocked.value === true ? 'div' : 'router-link');
 
 // router-link 利用時だけ遷移先を渡す
-const rootBindings = computed(() => {
-    if (rootTag.value !== 'router-link') return {};
+const programLinkProps = computed(() => {
+    if (programTag.value !== 'router-link') return {};
     return {
         to: props.program.recorded_video.status === 'Recorded'
             ? (props.forOffline ? `/videos/watch/${props.program.id}?source=offline` : `/videos/watch/${props.program.id}`)
@@ -565,16 +569,18 @@ const confirmDismissOfflineDownload = () => {
 
 // 端末内の保存データだけを削除することを、専用ダイアログで確認
 const deleteOfflineVideo = () => {
-    if (props.offlineVideo === null) return;
+    if (props.offlineVideo === null || isDeletingOfflineVideo.value) return;
+    offlineVideoToDelete.value = props.offlineVideo;
     showOfflineDeleteConfirmation.value = true;
 };
 
 // 確認後にオフライン保存を削除
 const confirmDeleteOfflineVideo = async (): Promise<void> => {
-    if (props.offlineVideo === null || isDeletingOfflineVideo.value === true) return;
+    const video = offlineVideoToDelete.value;
+    if (video === null || isDeletingOfflineVideo.value === true) return;
     isDeletingOfflineVideo.value = true;
     try {
-        await OfflineVideos.deleteVideo(props.program.id);
+        await OfflineVideos.deleteVideo(video);
     } catch (error) {
         Message.error(error instanceof Error ? error.message : 'オフライン保存を削除できませんでした。');
         return;
@@ -582,7 +588,6 @@ const confirmDeleteOfflineVideo = async (): Promise<void> => {
         isDeletingOfflineVideo.value = false;
     }
     showOfflineDeleteConfirmation.value = false;
-    emit('deleted', props.program.id);
     Message.success('オフライン保存を削除しました。');
 };
 
@@ -1273,12 +1278,19 @@ const deleteVideo = async () => {
     &--offline-job-failed {
         flex-direction: column;
         height: auto;
+        cursor: default;
         contain-intrinsic-height: auto 165px;
 
         .recorded-program__container {
             position: relative;
             height: auto;
             min-height: 112px;
+            color: inherit;
+            text-decoration: none;
+        }
+
+        a.recorded-program__container {
+            cursor: pointer;
         }
 
         .recorded-program__thumbnail {
