@@ -2,6 +2,7 @@
 
 import asyncio
 import concurrent.futures
+import errno
 import inspect
 import io
 import os
@@ -163,6 +164,51 @@ async def test_offline_video_session_replays_the_same_output(
     assert replacement.status_code == 201
     assert replacement.json()['generation_token'] != created.json()['generation_token']
     assert (await client.delete(url, headers=headers)).status_code == 409
+
+
+@pytest.mark.asyncio
+async def test_offline_video_session_replays_after_recording_io_error(
+    client: httpx.AsyncClient,
+    recording: tuple[int, Path],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """録画の一時的な I/O 障害から、同じセッションの未保存区間と終端を取り直せる。"""
+    video_id, path = recording
+    url = f'/api/streams/video/{video_id}/240p/offline-sessions/{uuid.uuid4().hex}'
+    created = await client.put(url)
+    assert created.status_code == 201
+    headers = {'X-KonomiTV-Offline-Generation': created.json()['generation_token']}
+    response = await client.get(f'{url}?connection_id=1&next_sequence=0', headers=headers)
+    assert response.status_code == 200
+    segments, count = ReadSegments(response.content)
+    assert len(segments) == count > 1
+
+    original_stat = Path.stat
+    calls_until_failure = 1
+
+    def StatWithTemporaryFailure(target: Path, *, follow_symlinks: bool = True) -> os.stat_result:
+        nonlocal calls_until_failure
+        if target == path and calls_until_failure > 0:
+            calls_until_failure -= 1
+            if calls_until_failure == 0:
+                raise OSError(errno.EIO, 'Temporary recording I/O error')
+        return original_stat(target, follow_symlinks=follow_symlinks)
+
+    monkeypatch.setattr(Path, 'stat', StatWithTemporaryFailure)
+    # 再接続時の照合で一度失敗しても、次の GET で既存のデータを取り直せる。
+    retry = await client.get(f'{url}?connection_id=2&next_sequence=1', headers=headers)
+    assert retry.status_code == 503
+    replay = await client.get(f'{url}?connection_id=3&next_sequence=1', headers=headers)
+    assert ReadSegments(replay.content) == (segments[1:], count)
+
+    # GET の照合は通し、正常終端を公開する直前の照合で失敗させる。
+    calls_until_failure = 2
+    interrupted = await client.get(f'{url}?connection_id=4&next_sequence={count}', headers=headers)
+    assert interrupted.status_code == 200
+    with pytest.raises(struct.error):
+        ReadSegments(interrupted.content)
+    end = await client.get(f'{url}?connection_id=5&next_sequence={count}', headers=headers)
+    assert ReadSegments(end.content) == ([], count)
 
 
 @pytest.mark.asyncio
@@ -719,7 +765,12 @@ async def test_offline_video_session_legacy_stream(
     assert len(segments) == count == 1
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize('phase', ['Probe', 'Feed', 'Retry'])
+@pytest.mark.parametrize(('phase', 'recording'), [
+    ('Probe', 'terrestrial-bdav-partial-ts.m2ts'),
+    ('Feed', 'terrestrial-bdav-partial-ts.m2ts'),
+    ('Retry', 'terrestrial-bdav-partial-ts.m2ts'),
+    ('Feed', 'terrestrial-psc-sidecar.mp4'),
+], indirect=['recording'])
 async def test_offline_video_session_releases_slot_during_input_read(
     client: httpx.AsyncClient,
     recording: tuple[int, Path],
@@ -744,7 +795,7 @@ async def test_offline_video_session_releases_slot_during_input_read(
             frame = inspect.currentframe()
             is_feed = False
             while frame is not None:
-                if frame.f_code.co_name == 'FeedTSStream':
+                if frame.f_code.co_name in ('FeedTSStream', 'FeedOfflineMP4Stream'):
                     is_feed = True
                     break
                 frame = frame.f_back
@@ -770,7 +821,20 @@ async def test_offline_video_session_releases_slot_during_input_read(
         encoder_started.set()
         return await original_wait(session, encoder)
 
-    monkeypatch.setattr(sys.modules[VideoEncodingTask.__module__], 'open', OpenInput, raising=False)
+    if path.suffix == '.mp4':
+        original_fdopen = os.fdopen
+
+        def OpenMP4Input(fd: int, *args: Any, **kwargs: Any) -> Any:
+            # psisimux の読み込みパイプだけを、停止する BufferedReader に差し替える。
+            frame = inspect.currentframe()
+            caller = frame.f_back if frame is not None else None
+            if caller is not None and caller.f_code is VideoEncodingTask.run.__code__:
+                return io.BufferedReader(StalledFile(fd, 'rb'))
+            return original_fdopen(fd, *args, **kwargs)
+
+        monkeypatch.setattr(os, 'fdopen', OpenMP4Input)
+    else:
+        monkeypatch.setattr(sys.modules[VideoEncodingTask.__module__], 'open', OpenInput, raising=False)
     monkeypatch.setattr(OfflineVideoSession, 'waitForCapacity', TrackEncoder)
     # 入力 read() 一つで既定プールを満杯にし、回収が同じプールの空きを待たないことを確認する。
     input_executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
@@ -965,7 +1029,7 @@ async def test_offline_video_session_retries_probe_only_before_publication(
 @pytest.mark.parametrize(('failure', 'recording'), [
     ('EncoderError', 'terrestrial-bdav-partial-ts.m2ts'),
     ('PartialPacket', 'terrestrial-bdav-partial-ts.m2ts'),
-    ('IncompleteInput', 'terrestrial-bdav-partial-ts.m2ts'),
+    ('IncompleteInput', 'terrestrial-tsreplace-h264.ts'),
     ('IncompleteMP4', 'terrestrial-psc-sidecar.mp4'),
 ], indirect=['recording'])
 async def test_offline_video_session_failed_encoder_releases_slot(
@@ -975,6 +1039,7 @@ async def test_offline_video_session_failed_encoder_releases_slot(
     failure: str,
 ) -> None:
     """変換の例外と異常 EOF で正常終端を送らず、再接続と実行枠を解放する。"""
+    video_id, path = recording
     encoders: set[asyncio.subprocess.Process] = set()
     mp4_muxers: list[asyncio.subprocess.Process] = []
     injected = False
@@ -987,20 +1052,19 @@ async def test_offline_video_session_failed_encoder_releases_slot(
     async def TrackEncoder(session: OfflineVideoSession, encoder: asyncio.subprocess.Process) -> bool:
         if encoder not in encoders and failure == 'PartialPacket':
             assert encoder.stdout is not None
-            original_read = encoder.stdout.readexactly
+            original_read = encoder.stdout.read
 
-            async def ReadWithPartialEOF(size: int) -> bytes:
+            async def ReadWithPartialEOF(size: int = -1) -> bytes:
                 nonlocal injected
-                try:
-                    return await original_read(size)
-                except asyncio.IncompleteReadError as ex:
-                    # 実際の変換結果の末尾に、未完成の TS パケットを一つ残す。
-                    assert ex.partial == b''
+                chunk = await original_read(size)
+                # 実際の変換結果の末尾に、未完成の TS パケットを一つ残す。
+                if not chunk and not injected:
                     assert await encoder.wait() == 0
                     injected = True
-                    raise asyncio.IncompleteReadError(b'\x47', size) from ex
+                    return b'\x47'
+                return chunk
 
-            monkeypatch.setattr(encoder.stdout, 'readexactly', ReadWithPartialEOF)
+            monkeypatch.setattr(encoder.stdout, 'read', ReadWithPartialEOF)
         encoders.add(encoder)
         return await original_wait(session, encoder)
 
@@ -1009,28 +1073,22 @@ async def test_offline_video_session_failed_encoder_releases_slot(
     else:
         monkeypatch.setattr(OfflineVideoSession, 'waitForCapacity', TrackEncoder)
         if failure == 'IncompleteInput':
-            loop = asyncio.get_running_loop()
-            original_run = loop.run_in_executor
+            # 録画のサイズ・更新日時を保ったまま、入力読み取りだけを半分の位置で終了させる。
+            eof_offset = path.stat().st_size // 2 // ts.PACKET_SIZE * ts.PACKET_SIZE
 
-            def RunWithIncompleteInput(
-                executor: concurrent.futures.Executor | None,
-                func: Callable[..., Any],
-                *args: Any,
-            ) -> asyncio.Future[Any]:
-                result = original_run(executor, func, *args)
-                if not isinstance(func, FunctionType) or func.__name__ != 'FeedTSStream':
-                    return result
-
-                async def ReportIncompleteInput() -> bool:
+            class ShortRecording(io.BufferedReader):
+                def read(self, size: int | None = -1) -> bytes:
                     nonlocal injected
-                    # 実プロセスは正常終了させ、入力フィードの完了通知だけを未完了にする。
-                    assert await result is True
-                    injected = True
-                    return False
+                    remaining = eof_offset - self.tell()
+                    if remaining <= 0:
+                        injected = True
+                        return b''
+                    return super().read(remaining if size is None or size < 0 else min(size, remaining))
 
-                return asyncio.create_task(ReportIncompleteInput())
+            def OpenShortRecording(file_name: str, mode: str) -> io.BufferedReader:
+                return ShortRecording(io.FileIO(file_name, mode))
 
-            monkeypatch.setattr(loop, 'run_in_executor', RunWithIncompleteInput)
+            monkeypatch.setattr(sys.modules[VideoEncodingTask.__module__], 'open', OpenShortRecording, raising=False)
         elif failure == 'IncompleteMP4':
             original_start = asyncio.subprocess.create_subprocess_exec
 
@@ -1046,7 +1104,6 @@ async def test_offline_video_session_failed_encoder_releases_slot(
 
             monkeypatch.setattr(asyncio.subprocess, 'create_subprocess_exec', StartWithShortMP4)
 
-    video_id, _ = recording
     url = f'/api/streams/video/{video_id}/240p/offline-sessions/{uuid.uuid4().hex}'
     session = await client.put(url)
     assert session.status_code == 201

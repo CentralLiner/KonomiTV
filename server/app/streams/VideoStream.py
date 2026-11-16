@@ -389,7 +389,12 @@ class VideoStream:
 
 
     async def encodeOffline(self) -> None:
-        """RAM 保存用のエンコードを先頭から実行し、プロセスの終了まで待つ。"""
+        """
+        RAM 保存用のエンコードを先頭から実行し、プロセスの終了まで待つ。
+
+        Returns:
+            None
+        """
         assert self.offline_session is not None
         self._ensureSegmentsInitialized()
         await self.resolveSegmentSourcePosition(0)
@@ -398,7 +403,12 @@ class VideoStream:
 
     @property
     def segment_duration_seconds(self) -> float:
-        """フレームレートから算出した通常セグメント長を返す。"""
+        """
+        フレームレートから算出した通常セグメント長を返す。
+
+        Returns:
+            float: セグメントの基準長 (秒)
+        """
         return self._segment_duration_seconds
 
 
