@@ -453,7 +453,20 @@ async def VideoOfflineSessionCreateAPI(
     quality: str,
     response: Response,
 ) -> OfflineVideoSessionInfo:
-    """オフライン保存用の RAM セッションを登録する。"""
+    """
+    オフライン保存用の RAM セッションを登録する。
+
+    Args:
+        session_id (str): クライアントが発行した保存 ID
+        recorded_program (RecordedProgram): 保存する録画番組
+        stream_quality (StreamQualityWithOptions): 検証済みの画質とエンコードオプション
+        quality (str): 追加オプションを含む要求画質
+        response (Response): 新規作成と再要求でステータスを切り替えるレスポンス
+
+    Returns:
+        OfflineVideoSessionInfo: 録画情報、画質、世代トークンを含むセッション情報
+    """
+
     session, is_created = OfflineVideoSession.create(session_id, recorded_program, quality, stream_quality)
     response.headers['Cache-Control'] = 'no-store'
     if not is_created:
@@ -474,7 +487,21 @@ async def VideoOfflineSessionStreamAPI(
     connection_id: Annotated[int, Query(ge=1, le=2**53 - 1)],
     generation_token: Annotated[str | None, Header(alias='X-KonomiTV-Offline-Generation')] = None,
 ) -> StreamingResponse:
-    """同じエンコード結果を、端末で未保存のセグメントから返す。"""
+    """
+    同じエンコード結果を、端末で未保存のセグメントから返す。
+
+    Args:
+        session_id (str): 接続先の保存 ID
+        video_id (int): 保存する録画番組の ID
+        quality (str): 追加オプションを含む要求画質
+        next_sequence (int): 端末でまだ保存していない最初のセグメント番号
+        connection_id (int): 接続を開くたびに増加する番号
+        generation_token (str | None): セッションの作成時に受け取った世代トークン
+
+    Returns:
+        StreamingResponse: 指定位置からのセグメントを送るレスポンス
+    """
+
     session = OfflineVideoSession.get(session_id, video_id, quality, generation_token)
     if session is None:
         raise OfflineVideoSessionError(410, 'session_unavailable')
@@ -493,7 +520,19 @@ async def VideoOfflineSessionDeleteAPI(
     quality: str,
     generation_token: Annotated[str | None, Header(alias='X-KonomiTV-Offline-Generation')] = None,
 ) -> Response:
-    """オフライン保存セッションが所有する資源を回収する。"""
+    """
+    オフライン保存セッションが所有する資源を回収する。
+
+    Args:
+        session_id (str): 終了する保存 ID
+        video_id (int): 保存する録画番組の ID
+        quality (str): 追加オプションを含む要求画質
+        generation_token (str | None): セッションの作成時に受け取った世代トークン
+
+    Returns:
+        Response: 回収が完了したことを示す 204 レスポンス
+    """
+
     session = OfflineVideoSession.get(session_id, video_id, quality, generation_token)
     if session is not None:
         await asyncio.shield(session.close())
@@ -511,7 +550,20 @@ async def VideoOfflineSessionCheckpointAPI(
     checkpoint: OfflineVideoCheckpoint,
     generation_token: Annotated[str | None, Header(alias='X-KonomiTV-Offline-Generation')] = None,
 ) -> OfflineVideoCheckpoint:
-    """端末が連続して保存できた位置を受け取り、現在の確定位置を返す。"""
+    """
+    端末が連続して保存できた位置を受け取り、現在の確定位置を返す。
+
+    Args:
+        session_id (str): 通知先の保存 ID
+        video_id (int): 保存する録画番組の ID
+        quality (str): 追加オプションを含む要求画質
+        checkpoint (OfflineVideoCheckpoint): 接続番号と次に保存するセグメント番号
+        generation_token (str | None): セッションの作成時に受け取った世代トークン
+
+    Returns:
+        OfflineVideoCheckpoint: 接続番号とサーバーが確認済みの位置
+    """
+
     session = OfflineVideoSession.get(session_id, video_id, quality, generation_token)
     if session is None:
         raise OfflineVideoSessionError(410, 'session_unavailable')

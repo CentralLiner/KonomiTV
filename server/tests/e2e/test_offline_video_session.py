@@ -10,7 +10,7 @@ import sys
 import threading
 import uuid
 from collections import Counter
-from collections.abc import AsyncGenerator, Callable
+from collections.abc import AsyncGenerator, Awaitable, Callable
 from datetime import datetime
 from pathlib import Path
 from types import FunctionType
@@ -543,6 +543,79 @@ async def test_offline_video_session_cancels_pending_encoding(
 
 
 @pytest.mark.asyncio
+async def test_offline_video_session_closes_input_pipe_on_cancel_during_cleanup(
+    client: httpx.AsyncClient,
+    recording: tuple[int, Path],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    エンコード失敗後の回収中に DELETE が届いても、未起動のフィードに渡した書き込み側 FD を閉じる。
+
+    Args:
+        client (httpx.AsyncClient): テスト用 API クライアント
+        recording (tuple[int, Path]): 登録済み録画の ID とパス
+        monkeypatch (pytest.MonkeyPatch): 入力フィードの待機とエンコード失敗の再現に使用
+
+    Returns:
+        None
+    """
+    loop = asyncio.get_running_loop()
+    queued_feed: asyncio.Future[bool] = loop.create_future()
+    waiting_for_feed = asyncio.Event()
+    pipe_fd: int | None = None
+    original_run_in_executor = loop.run_in_executor
+    original_to_thread = anyio.to_thread.run_sync
+    original_wait_for = asyncio.wait_for
+
+    async def TrackRegistration[T](func: Callable[..., T], /, *args: Any, **kwargs: Any) -> T:
+        nonlocal pipe_fd
+        if func.__name__ == '__registerTSReadExInputPipe':
+            pipe_fd = args[0]
+        return await original_to_thread(func, *args, **kwargs)
+
+    def QueueFeed(executor: concurrent.futures.Executor | None, func: Callable[..., Any], *args: Any) -> asyncio.Future[Any]:
+        # 入力ワーカーが使用中で、フィードがまだキューにある状態を作る。
+        if isinstance(func, FunctionType) and func.__name__ == 'FeedTSStream':
+            return queued_feed
+        return original_run_in_executor(executor, func, *args)
+
+    async def WaitFor[T](awaitable: Awaitable[T], timeout: float | None) -> T:
+        if awaitable is queued_feed:
+            waiting_for_feed.set()
+        return await original_wait_for(awaitable, timeout)
+
+    async def FailEncoding(session: OfflineVideoSession, encoder: asyncio.subprocess.Process) -> bool:
+        raise RuntimeError('Encoder failed before the input worker started.')
+
+    monkeypatch.setattr(anyio.to_thread, 'run_sync', TrackRegistration)
+    monkeypatch.setattr(loop, 'run_in_executor', QueueFeed)
+    monkeypatch.setattr(asyncio, 'wait_for', WaitFor)
+    monkeypatch.setattr(OfflineVideoSession, 'waitForCapacity', FailEncoding)
+
+    video_id, _ = recording
+    url = f'/api/streams/video/{video_id}/240p/offline-sessions/{uuid.uuid4().hex}'
+    created = await client.put(url)
+    assert created.status_code == 201
+    headers = {'X-KonomiTV-Offline-Generation': created.json()['generation_token']}
+    response_task = asyncio.create_task(client.get(f'{url}?connection_id=1&next_sequence=0', headers=headers))
+    try:
+        await asyncio.wait_for(waiting_for_feed.wait(), timeout=10)
+        assert pipe_fd is not None
+        assert (await client.delete(url, headers=headers)).status_code == 204
+        with pytest.raises(OSError):
+            os.fstat(pipe_fd)
+    finally:
+        await client.delete(url, headers=headers)
+        await response_task
+        # 修正前のコードで漏れを検出した場合も、テスト側で残った FD を閉じる。
+        if pipe_fd is not None:
+            try:
+                os.close(pipe_fd)
+            except OSError:
+                pass
+
+
+@pytest.mark.asyncio
 async def test_offline_video_session_accepts_stale_database_mtime(
     client: httpx.AsyncClient,
     recording: tuple[int, Path],
@@ -618,6 +691,11 @@ async def test_offline_video_session_sends_keepalive_during_final_validation(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize('recording', [
+    'terrestrial-bdav-partial-ts.m2ts',
+    'terrestrial-tsreplace-h264.ts',
+    'terrestrial-psc-sidecar.mp4',
+], indirect=True)
 async def test_offline_video_session_legacy_stream(
     client: httpx.AsyncClient,
     recording: tuple[int, Path],
