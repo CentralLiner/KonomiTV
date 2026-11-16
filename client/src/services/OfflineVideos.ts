@@ -63,7 +63,7 @@ class OfflineDownloadNetworkError extends Error {
 }
 
 /**
- * 録画番組のオフライン保存ジョブとダウンロード応答の展開を管理する。
+ * 録画番組のオフライン保存ジョブとダウンロードレスポンスの展開を管理する。
  */
 export default class OfflineVideos {
 
@@ -290,7 +290,7 @@ export default class OfflineVideos {
                 throw new Error('このブラウザではバックグラウンド保存を利用できません。');
             }
 
-            // Background Fetch は一時応答と展開後キャッシュが併存するため、前景保存の2倍を空き容量判定へ使う
+            // Background Fetch は一時レスポンスと展開後キャッシュが併存するため、前景保存の2倍を空き容量判定へ使う
             const storageEstimate = await navigator.storage?.estimate() ?? {};
             const availableBytes = (storageEstimate.quota ?? 0) - (storageEstimate.usage ?? 0);
             const requiredBytes = requiredStorageBytes * (shouldUseBackgroundFetch === true ? 2 : 1);
@@ -430,7 +430,7 @@ export default class OfflineVideos {
         }
         await this.updateJob(job);
 
-        // 実況は時間がかかるため、保存開始と並行で受信する。
+        // 実況 API はレスポンスが遅くなりがちなため、動画の保存開始と並行で受信する。
         void (async () => {
             const destination = `${baseURL}/assets/jikkyo.json`;
             const response = await fetch(new Request(`${Utils.api_base_url}/videos/${job.video_id}/jikkyo`, {signal}));
@@ -879,9 +879,9 @@ export default class OfflineVideos {
     }
 
     /**
-     * Background Fetch または前景 Fetch の応答を CacheStorage へ展開する。
+     * Background Fetch のレスポンスを CacheStorage へ展開する。
      * @param jobID 保存ジョブ ID
-     * @param response オフライン保存 API の応答
+     * @param response オフライン保存 API のレスポンス内容
      */
     static async finalizeResponse(jobID: string, response: Response): Promise<void> {
         const job = await OfflineVideoStorage.getJob(jobID);
@@ -974,11 +974,13 @@ export default class OfflineVideos {
         };
 
         try {
+            // 固定マジック値が一致しないレスポンスは、サーバーのエラーページや未知の形式として扱う。
             const magic = await readBytes(this.STREAM_MAGIC.byteLength);
             if (magic.some((value, index) => value !== this.STREAM_MAGIC[index])) {
                 throw new Error('オフライン保存データの形式を認識できません。');
             }
 
+            // 先頭 JSON から録画ファイルと画質を照合し、この保存ジョブのレスポンスであることを確認する。
             const metadataLength = new DataView((await readBytes(4)).buffer).getUint32(0);
             if (metadataLength === 0 || metadataLength > 1024 * 1024) {
                 throw new Error('オフライン保存データのメタデータ長が不正です。');
@@ -1034,6 +1036,7 @@ export default class OfflineVideos {
                 progress.sizeBytes += segmentLength;
             }
         } finally {
+            // 終端・破損レスポンス・キャンセルで読み取りを終え、接続とストリームロックを解放する。
             await reader.cancel().catch((error: unknown) => {
                 if (signal?.aborted !== true) {
                     console.warn('[OfflineVideos] Failed to cancel the offline download response reader:', error);
