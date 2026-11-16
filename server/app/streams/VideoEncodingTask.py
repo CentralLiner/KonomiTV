@@ -11,7 +11,8 @@ import queue
 import threading
 import time
 from collections import deque
-from typing import TYPE_CHECKING, ClassVar, Literal, cast
+from collections.abc import Callable
+from typing import TYPE_CHECKING, BinaryIO, ClassVar, Literal, cast
 
 from biim.mpeg2ts import ts
 from biim.mpeg2ts.h264 import H264PES
@@ -411,7 +412,7 @@ class VideoEncodingTask:
         CONFIG = Config()
         ENCODER_TYPE = CONFIG.general.encoder
         offline_session = self.video_stream.offline_session
-        if self._is_cancelled:
+        if offline_session is not None and self._is_cancelled:
             return
 
         # 新しいエンコードタスクを起動させた時点で既にエンコード済みのセグメントは使えなくなるので、すべてリセットする
@@ -422,7 +423,8 @@ class VideoEncodingTask:
         # 処理対象の VideoStreamSegment を取得し、エンコード中状態に設定
         current_sequence = start_sequence
         current_segment: VideoStreamSegment = self.video_stream.segments[current_sequence]
-        current_segment.encode_status = 'Encoding'
+        if offline_session is None:
+            current_segment.encode_status = 'Encoding'
         logging.info(f'{self.video_stream.log_prefix}[Segment {current_sequence}] Starting the Encoder...')
 
         # VideoStream 側で解決済みのソース DTS を、エンコーダー出力のタイムスタンプ基準として使う
@@ -431,9 +433,9 @@ class VideoEncodingTask:
             raise RuntimeError(f'Source start DTS is not resolved. [sequence: {current_sequence}]')
         output_ts_offset = current_segment.source_start_dts / ts.HZ
 
-        # MPEG-TS 形式の場合のみ、録画ファイルを開く
-        # それ以外の場合は一旦 None とする
+        # 通常配信の MPEG-TS はここで開く。RAM 保存の入力は読み取り側のワーカーが開閉する。
         file = None
+        file_path = self.video_stream.recorded_program.recorded_video.file_path
         if self.video_stream.recorded_program.recorded_video.container_format == 'MPEG-TS':
             # 再生しながらのキーフレーム収集は補助的な高速化なので、初期化に失敗しても再生本体は続ける
             ## 既存の segment_map から開始位置を解決済みの録画では、PAT/PMT や先頭 DTS の再探索が失敗してもエンコード自体は可能
@@ -441,7 +443,8 @@ class VideoEncodingTask:
                 await self.video_stream.ensureTSKeyFrameContext()
             except Exception as ex:
                 logging.warning(f'{self.video_stream.log_prefix} Failed to initialize input keyframe collector context:', exc_info=ex)
-            file = await asyncio.to_thread(open, self.video_stream.recorded_program.recorded_video.file_path, 'rb')
+            if offline_session is None:
+                file = open(file_path, 'rb')
 
         # 入力 TS を tsreadex に渡すついでに見つけたキーフレームを保持する
         ## ワーカースレッドでは DB を触らず、イベントループ側が節目ごとに segment_map へ変換して保存する
@@ -510,12 +513,17 @@ class VideoEncodingTask:
 
         # 切り出した HLS セグメント用 MPEG-TS パケットを一時的に保持するバッファ
         encoded_segment = bytearray()
+        append_packet: Callable[[bytes], None] = encoded_segment.extend
+        if offline_session is not None:
+            max_segment_bytes = offline_session.MAX_SEGMENT_BYTES
 
-        def AppendPacket(packet: bytes) -> None:
-            """生成中のセグメントの上限を確認してから TS パケットを追加する。"""
-            if offline_session is not None and len(encoded_segment) + len(packet) > offline_session.MAX_SEGMENT_BYTES:
-                raise RuntimeError('Offline segment exceeded the maximum size.')
-            encoded_segment.extend(packet)
+            def AppendOfflinePacket(packet: bytes) -> None:
+                """RAM 保存では、生成中のセグメントの上限を確認してから TS パケットを追加する。"""
+                if len(encoded_segment) + len(packet) > max_segment_bytes:
+                    raise RuntimeError('Offline segment exceeded the maximum size.')
+                encoded_segment.extend(packet)
+
+            append_packet = AppendOfflinePacket
 
         # 例外経路で未回収の raw pipe FD が残らないように、現在の反復で確保した read 側 FD を保持する
         ## 通常経路では create_subprocess_exec() の直後に close されるが、起動失敗時は finally 句まで到達しないため
@@ -610,7 +618,7 @@ class VideoEncodingTask:
 
         try:
             # 最大 MAX_RETRY_COUNT 回までリトライする
-            while self._retry_count < self.MAX_RETRY_COUNT and not self._is_cancelled:
+            while self._retry_count < self.MAX_RETRY_COUNT and (offline_session is None or not self._is_cancelled):
 
                 # MPEG-TS セクションパーサーを初期化
                 pat_parser: SectionParser[PATSection] = SectionParser(PATSection)
@@ -674,6 +682,9 @@ class VideoEncodingTask:
                         # 標準出力
                         '-',
                     ]
+                    if offline_session is not None:
+                        # 先頭の NULL パケットに合成 TS の全体サイズと出力開始位置を載せる。
+                        psisimux_options.insert(0, '-p')
 
                     # psisimux の読み込み用パイプと書き込み用パイプを作成
                     psisimux_read_pipe, psisimux_write_pipe = os.pipe()
@@ -692,7 +703,6 @@ class VideoEncodingTask:
                 else:
                     tsreadex_service_id = f'{self.video_stream.recorded_program.channel.service_id}' \
                         if self.video_stream.recorded_program.channel is not None else '-1'
-                    assert file is not None
                     if current_segment.source_file_position is None:
                         raise RuntimeError(f'Source file position is not resolved. [sequence: {current_sequence}]')
 
@@ -707,8 +717,18 @@ class VideoEncodingTask:
                     search_end_pos = current_segment.source_file_position
 
                     # 探索範囲のデータを読み込む
-                    await asyncio.to_thread(file.seek, search_start_pos)
-                    search_data = await asyncio.to_thread(file.read, search_end_pos - search_start_pos)
+                    if offline_session is None:
+                        assert file is not None
+                        file.seek(search_start_pos)
+                        search_data = file.read(search_end_pos - search_start_pos)
+                    else:
+                        def ReadPATPMTData() -> bytes:
+                            """探索中にキャンセルされても、読み取りを終えたワーカーがファイルを閉じる。"""
+                            with open(file_path, 'rb') as search_file:
+                                search_file.seek(search_start_pos)
+                                return search_file.read(search_end_pos - search_start_pos)
+
+                        search_data = await asyncio.to_thread(ReadPATPMTData)
 
                     # PAT/PMT を抽出（セグメント開始位置に最も近いものを保持）
                     temp_pat_parser = SectionParser(PATSection)
@@ -811,7 +831,9 @@ class VideoEncodingTask:
                         )
 
                     # 実際のセグメント開始位置にシーク
-                    await asyncio.to_thread(file.seek, current_segment.source_file_position)
+                    if offline_session is None:
+                        assert file is not None
+                        file.seek(current_segment.source_file_position)
 
                 # tsreadex のオプション
                 ## 放送波の前処理を行い、エンコードを安定させるツール
@@ -855,19 +877,34 @@ class VideoEncodingTask:
                 tsreadex_read_pipe, tsreadex_write_pipe = os.pipe()
 
                 try:
-                    # RAM 保存の TS 入力は、書き込み側でファイルの末尾を確認する。
+                    # RAM 保存は入力の末尾を確認するため、TS と MP4 の両方でフィードを経由する。
                     # 抽出できた PAT/PMT はストリームの先頭に加える。
-                    if initial_pat_pmt_data is not None or (offline_session is not None and file is not None):
-                        # PAT/PMT を先頭に加えた TS データ用の読み込み用パイプと書き込み用パイプを作成
-                        tsreadex_stdin_read, tsreadex_stdin_write = os.pipe()
-                        tsreadex_stdin_write_generation_token = await asyncio.to_thread(self.__registerTSReadExInputPipe, tsreadex_stdin_write)
+                    if initial_pat_pmt_data is not None or offline_session is not None:
                         pat_pmt_data = initial_pat_pmt_data or b''
                         # FeedTSStream() はワーカースレッドで動くため、クロージャ経由で参照する値をここでキャプチャしておく
                         feed_start_source_dts = current_segment.source_start_dts
                         feed_ts_stream_info = self.video_stream.ts_stream_info
 
-                        def FeedTSStream() -> bool:
-                            """TS を供給し、入力の末尾まで書き込んだ場合に True を返す。"""
+                        def FeedTSStream(
+                            tsreadex_stdin_write: int,
+                            tsreadex_stdin_write_generation_token: object,
+                            psisimux_input: BinaryIO | None,
+                            file: BinaryIO | None,
+                            source_file_position: int | None,
+                        ) -> bool:
+                            """
+                            元の TS または psisimux の出力を tsreadex へ供給する。
+
+                            Args:
+                                tsreadex_stdin_write (int): 入力パイプの書き込み側 FD
+                                tsreadex_stdin_write_generation_token (object): 入力パイプの世代
+                                psisimux_input (BinaryIO | None): MP4 から合成した TS の入力パイプ
+                                file (BinaryIO | None): 通常配信で開いた入力ファイル。RAM 保存ではワーカー内で開く
+                                source_file_position (int | None): MPEG-TS の入力開始位置
+
+                            Returns:
+                                bool: 入力の末尾まで書き込んだ場合は True
+                            """
 
                             input_keyframe_collector: TSKeyFrameCollector | None = None
                             if feed_ts_stream_info is not None and feed_start_source_dts is not None:
@@ -895,12 +932,33 @@ class VideoEncodingTask:
                                 return True
 
                             try:
+                                if psisimux_input is not None:
+                                    # 終了コードが 0 でも、psisimux が宣言した末尾まで出力したことを確認する。
+                                    # -p のヘッダーは制御情報なので tsreadex へは流さない。
+                                    with psisimux_input:
+                                        header = psisimux_input.read(ts.PACKET_SIZE)
+                                        if len(header) != ts.PACKET_SIZE or header[:4] != b'\x47\x1f\xff\x10':
+                                            return False
+                                        remaining = int.from_bytes(header[8:16], 'little') - int.from_bytes(header[16:24], 'little')
+                                        if remaining <= 0 or remaining % ts.PACKET_SIZE != 0:
+                                            return False
+                                        while chunk := psisimux_input.read(64 * 1024):
+                                            remaining -= len(chunk)
+                                            if remaining < 0 or not WriteAllToPipe(tsreadex_stdin_write, chunk):
+                                                return False
+                                        return remaining == 0
+
                                 # まず PAT/PMT を書き込む
                                 if WriteAllToPipe(tsreadex_stdin_write, pat_pmt_data) is False:
                                     return False
                                 # 次にファイルから読み込んだデータを書き込む
                                 ## initial_pat_pmt_data が作られているのは MPEG-TS のときだから
                                 ## psisimux からの入力を想定する必要はない
+                                if offline_session is not None:
+                                    # 試行ごとに所有し、遅い読み取りと次の試行の seek/close を競合させない。
+                                    assert source_file_position is not None
+                                    file = open(file_path, 'rb')
+                                    file.seek(source_file_position)
                                 assert file is not None
                                 packet_size = feed_ts_stream_info.packet_size if feed_ts_stream_info is not None else ts.PACKET_SIZE
                                 chunk_size = packet_size * 10000  # 10000 パケットずつ読み込む
@@ -974,13 +1032,30 @@ class VideoEncodingTask:
                                     expected_pipe_fd = tsreadex_stdin_write,
                                     expected_generation_token = tsreadex_stdin_write_generation_token,
                                 )
+                                if offline_session is not None and file is not None:
+                                    file.close()
                             return False
 
-                        # tsreadex のプロセスを作成・実行
+                        # フィードから tsreadex へ TS を渡すパイプを作成する。
+                        tsreadex_stdin_read, tsreadex_stdin_write = os.pipe()
                         try:
+                            if offline_session is None:
+                                tsreadex_stdin_write_generation_token = self.__registerTSReadExInputPipe(tsreadex_stdin_write)
+                            else:
+                                # RAM 保存では登録中のキャンセルでも、書き込み側の所有権を確定してから終了処理へ渡す。
+                                register_pipe_task = asyncio.create_task(asyncio.to_thread(
+                                    self.__registerTSReadExInputPipe, tsreadex_stdin_write,
+                                ))
+                                try:
+                                    tsreadex_stdin_write_generation_token = await asyncio.shield(register_pipe_task)
+                                except asyncio.CancelledError:
+                                    await register_pipe_task
+                                    raise
+
+                            # tsreadex のプロセスを作成・実行
                             self._tsreadex_process = await asyncio.subprocess.create_subprocess_exec(
                                 LIBRARY_PATH['tsreadex'], *tsreadex_options,
-                                stdin = tsreadex_stdin_read,  # PAT/PMT が付加されたデータ
+                                stdin = tsreadex_stdin_read,
                                 stdout = tsreadex_write_pipe,  # エンコーダーに繋ぐ
                                 stderr = asyncio.subprocess.DEVNULL,
                             )
@@ -990,10 +1065,15 @@ class VideoEncodingTask:
                             # これを忘れるとファイルディスクリプタがリークする
                             os.close(tsreadex_stdin_read)
 
-                        # tsreadex に PAT/PMT を先頭に付加した TS ストリームを流し込むタスクを ThreadPoolExecutor で実行
-                        # 同期関数のため run_in_executor() を使ってスレッドプールに投げることで、非同期で実行する
-                        loop = asyncio.get_running_loop()
-                        self._tsreadex_feed_task = loop.run_in_executor(None, FeedTSStream)
+                        # MP4 の読み込み側 FD は、フィードを担当するワーカースレッドへ渡す。
+                        psisimux_input = None
+                        if psisimux_read_pipe is not None:
+                            psisimux_input = os.fdopen(psisimux_read_pipe, 'rb')
+                            psisimux_read_pipe = None
+                        self._tsreadex_feed_task = asyncio.get_running_loop().run_in_executor(
+                            None, FeedTSStream, tsreadex_stdin_write, tsreadex_stdin_write_generation_token,
+                            psisimux_input, file, current_segment.source_file_position,
+                        )
                     else:
                         # tsreadex のプロセスを作成・実行
                         try:
@@ -1077,7 +1157,7 @@ class VideoEncodingTask:
                 last_read_time = asyncio.get_running_loop().time()
 
                 # 新しいセグメントのエンコードを開始するため、バッファをリセット
-                encoded_segment = bytearray()
+                encoded_segment.clear()
                 # エンコーダーの stdout が常に読める状態でも他の非同期タスクへ定期的に制御を返すためのカウンタ
                 yield_packet_count = 0
                 # セグメント境界をランダムアクセスフレームに合わせるためのフラグ
@@ -1103,10 +1183,10 @@ class VideoEncodingTask:
                 previous_output_dts: int | None = None
                 offline_segment_has_video = False
                 is_output_eof = False
+                should_retry_initial_probe = False
 
                 if offline_session is not None and not await offline_session.waitForCapacity(self._encoder_process):
                     break
-                last_read_time = asyncio.get_running_loop().time()
 
                 while True:
                     # エンコードタスクがキャンセルされた場合、処理を中断する
@@ -1153,12 +1233,17 @@ class VideoEncodingTask:
                         if ex.partial:
                             raise RuntimeError('Encoder output ended inside a TS packet.') from ex
 
+                        # 公開前に映像・音声の解析が完了しなかった場合だけ、既存の起動リトライへ進む。
+                        if current_sequence == start_sequence and (video_pid is None or audio_pid is None):
+                            should_retry_initial_probe = True
+                            break
+
                         # 下流の stdout が自然 EOF に達した後、すべての入力・変換プロセスの正常終了を確認する。
                         async with asyncio.timeout(5):
                             for process in (self._encoder_process, self._tsreadex_process, self._psisimux_process):
                                 if process is not None and await process.wait() != 0:
                                     raise RuntimeError('An offline encoding process exited with an error.')
-                            if self._tsreadex_feed_task is not None and not await asyncio.shield(self._tsreadex_feed_task):
+                            if self._tsreadex_feed_task is None or not await asyncio.shield(self._tsreadex_feed_task):
                                 raise RuntimeError('Offline encoding stopped before the end of the input file.')
                         if self._is_cancelled:
                             break
@@ -1176,13 +1261,12 @@ class VideoEncodingTask:
                         packet = b''
                         pid = video_pid
                     else:
-                        if packet[:1] != ts.SYNC_BYTE:
-                            if offline_session is not None:
+                        if offline_session is not None:
+                            if packet[:1] != ts.SYNC_BYTE:
                                 raise RuntimeError('Invalid sync byte in offline encoder output.')
-                            packet = ts.SYNC_BYTE + packet[1:]
+                            if ts.transport_error_indicator(packet) or packet[3] & 0x30 == 0:
+                                raise RuntimeError('Invalid TS packet in offline encoder output.')
                         pid = ts.pid(packet)
-                        if offline_session is not None and (ts.transport_error_indicator(packet) or packet[3] & 0x30 == 0):
-                            raise RuntimeError('Invalid TS packet in offline encoder output.')
 
                     # PAT (Program Association Table)
                     if not is_output_eof and pid == 0x00:
@@ -1200,7 +1284,7 @@ class VideoEncodingTask:
 
                             # PAT を再構築して candidate に追加
                             for packet in packetize_section(pat, False, False, 0, 0, pat_cc):
-                                AppendPacket(packet)
+                                append_packet(packet)
                                 pat_cc = (pat_cc + 1) & 0x0F
 
                     # PMT (Program Map Table)
@@ -1233,7 +1317,7 @@ class VideoEncodingTask:
                                         logging.debug(f'{self.video_stream.log_prefix} AAC PID: 0x{elementary_pid:04x}')
                             # PMT を再構築して candidate に追加
                             for packet in packetize_section(pmt, False, False, cast(int, pmt_pid), 0, pmt_cc):
-                                AppendPacket(packet)
+                                append_packet(packet)
                                 pmt_cc = (pmt_cc + 1) & 0x0F
 
                     # 映像ストリーム
@@ -1286,20 +1370,21 @@ class VideoEncodingTask:
                                 if offline_segment_start_pts is None:
                                     offline_segment_start_pts = presentation_timestamp
 
-                            # Future がまだ未完了の場合にのみ実行
+                            # 次の分割境界を判定する。
                             if current_segment is not None:
                                 # 判定に用いる次セグメント開始時刻
                                 ## source_start_dts は目標時刻以前のキーフレームに戻るため、境界判定はプレイリスト上の経過時間から逆算する
-                                next_segment_start_timestamp = first_segment_source_start_dts + round(
-                                    (
-                                        current_segment.playlist_start_seconds +
-                                        current_segment.duration_seconds -
-                                        first_segment_playlist_start_seconds
-                                    ) * ts.HZ
-                                )
                                 if offline_session is not None:
                                     # 実際のランダムアクセスフレームの位置から次の分割を計画する。
                                     next_segment_start_timestamp = offline_segment_start + round(self.video_stream.segment_duration_seconds * ts.HZ)
+                                else:
+                                    next_segment_start_timestamp = first_segment_source_start_dts + round(
+                                        (
+                                            current_segment.playlist_start_seconds +
+                                            current_segment.duration_seconds -
+                                            first_segment_playlist_start_seconds
+                                        ) * ts.HZ
+                                    )
                                 # logging.debug(
                                 #     f'{self.video_stream.log_prefix} Current Timestamp: {current_timestamp_unwrapped} / '
                                 #     f'Next Segment Start Timestamp: {next_segment_start_timestamp}'
@@ -1310,15 +1395,11 @@ class VideoEncodingTask:
                                     try:
                                         if isinstance(pes, H264PES):
                                             for ebsp in pes.ebsps:
-                                                if not ebsp:
-                                                    continue
                                                 nal_unit_type = ebsp[0] & 0x1f
                                                 if nal_unit_type == 0x05:
                                                     return True
                                         elif isinstance(pes, H265PES):
                                             for ebsp in pes.ebsps:
-                                                if not ebsp:
-                                                    continue
                                                 nal_unit_type = (ebsp[0] >> 1) & 0x3f
                                                 # H.265 は BLA / IDR / CRA をランダムアクセスフレームとして扱う
                                                 if nal_unit_type in (16, 17, 18, 19, 20, 21):
@@ -1350,15 +1431,16 @@ class VideoEncodingTask:
                                     if offline_session is not None:
                                         assert offline_segment_start_pts is not None
                                         offline_session.publishSegment(
-                                            current_segment,
+                                            current_sequence,
                                             encoded_segment,
                                             max(1, presentation_timestamp - offline_segment_start_pts) / ts.HZ,
                                         )
                                         offline_segment_start = current_timestamp_unwrapped
                                         offline_segment_start_pts = presentation_timestamp
-                                    elif not current_segment.encoded_segment_ts_future.done():
-                                        current_segment.encoded_segment_ts_future.set_result(bytes(encoded_segment))
-                                    current_segment.encode_status = 'Completed'
+                                    else:
+                                        if not current_segment.encoded_segment_ts_future.done():
+                                            current_segment.encoded_segment_ts_future.set_result(bytes(encoded_segment))
+                                        current_segment.encode_status = 'Completed'
                                     logging.info(f'{self.video_stream.log_prefix}[Segment {current_sequence}] Successfully Encoded HLS Segment.')
 
                                     # 次のセグメントへ移行
@@ -1374,18 +1456,15 @@ class VideoEncodingTask:
                                     # 新しいセグメント用のデータと状態を初期化
                                     ## ここで encoded_segment は空の bytearray にリセットされる
                                     logging.info(f'{self.video_stream.log_prefix}[Segment {current_sequence}] Encoding...')
-                                    if offline_session is not None:
-                                        current_segment = self.video_stream.getOfflineEncodingSegment(current_sequence)
-                                    else:
-                                        current_segment = self.video_stream.segments[current_sequence]
-                                    current_segment.encode_status = 'Encoding'
-                                    encoded_segment = bytearray()
+                                    encoded_segment.clear()
                                     is_split_pending = False
                                     if offline_session is not None:
                                         offline_segment_has_video = False
                                         if not await offline_session.waitForCapacity(self._encoder_process):
                                             break
-                                        last_read_time = asyncio.get_running_loop().time()
+                                    else:
+                                        current_segment = self.video_stream.segments[current_sequence]
+                                        current_segment.encode_status = 'Encoding'
                                     # セグメント切り替えのタイミングで、蓄積されたキーフレーム情報の保存を試みる
                                     ## バッチ閾値に達していなければ何もせずに返る
                                     await FlushCollectedSegmentMap()
@@ -1393,16 +1472,16 @@ class VideoEncodingTask:
                                     # 新しいセグメントの先頭に PAT と PMT を追加
                                     if latest_pat is not None:
                                         for packet in packetize_section(latest_pat, False, False, 0, 0, pat_cc):
-                                            AppendPacket(packet)
+                                            append_packet(packet)
                                             pat_cc = (pat_cc + 1) & 0x0F
                                     if latest_pmt is not None:
                                         for packet in packetize_section(latest_pmt, False, False, cast(int, pmt_pid), 0, pmt_cc):
-                                            AppendPacket(packet)
+                                            append_packet(packet)
                                             pmt_cc = (pmt_cc + 1) & 0x0F
 
                             # 現在の映像 PES をパケット化して、現在処理対象のセグメントに追加
                             for packet in packetize_pes(video, False, False, cast(int, video_pid), 0, video_cc):
-                                AppendPacket(packet)
+                                append_packet(packet)
                                 video_cc = (video_cc + 1) & 0x0F
                             offline_segment_has_video = True
 
@@ -1413,12 +1492,12 @@ class VideoEncodingTask:
                         for audio in audio_parser:
                             # PES パケットを再構築して candidate に追加
                             for packet in packetize_pes(audio, False, False, cast(int, audio_pid), 0, audio_cc):
-                                AppendPacket(packet)
+                                append_packet(packet)
                                 audio_cc = (audio_cc + 1) & 0x0F
 
                     # その他のパケット
                     else:
-                        AppendPacket(packet)
+                        append_packet(packet)
 
                     if is_output_eof:
                         break
@@ -1436,7 +1515,7 @@ class VideoEncodingTask:
                     if offline_session is None and current_sequence >= len(self.video_stream.segments):
                         break
 
-                if offline_session is not None:
+                if offline_session is not None and not should_retry_initial_probe:
                     if self._is_cancelled:
                         break
                     if (
@@ -1447,11 +1526,11 @@ class VideoEncodingTask:
                             DumpEncoderStderr(current_encoder_stderr_lines, is_warning = True)
                         raise RuntimeError('Offline encoding did not produce a complete stream.')
                     offline_session.publishSegment(
-                        current_segment,
+                        current_sequence,
                         encoded_segment,
                         max(1, latest_output_pts - offline_segment_start_pts + output_frame_ticks) / ts.HZ,
                     )
-                    encoded_segment = bytearray()
+                    encoded_segment.clear()
                     break
 
                 # エンコーダープロセスを終了
@@ -1493,27 +1572,7 @@ class VideoEncodingTask:
                     except Exception as ex:
                         logging.error(f'{self.video_stream.log_prefix} Failed to terminate tsreadex process:', exc_info=ex)
 
-                    # フィードタスクの完了を待つ
-                    ## tsreadex を強制終了した時点でパイプの読み手側が消えるため、
-                    ## ワーカースレッドの os.write() は BrokenPipeError で抜けて、自身の finally で FD を閉じてくれるはず
-                    if self._tsreadex_feed_task is not None:
-                        feed_wait_start_time = time.perf_counter()
-                        try:
-                            await asyncio.wait_for(self._tsreadex_feed_task, timeout=3.0)
-                            feed_wait_elapsed_ms = (time.perf_counter() - feed_wait_start_time) * 1000
-                            logging.debug(f'{self.video_stream.log_prefix} Feed task completed in {feed_wait_elapsed_ms:.1f}ms.')
-                        except TimeoutError:
-                            logging.warning(f'{self.video_stream.log_prefix} Feed task did not complete within timeout (3s) after tsreadex kill.')
-                        except Exception:
-                            pass
-
-                    # tsreadex stdin の書き込み側 FD を保険として閉じる
-                    ## ワーカースレッドが先に閉じていれば no-op になる
-                    ## ここに到達した時点で tsreadex.wait() の完了は確定しており、ワーカースレッドも BrokenPipeError 経由で
-                    ## 抜けているはずなので、イベントループ (メインスレッド) が os.close() で固まる懸念はない
-                    await asyncio.to_thread(self.__closeTSReadExInputPipe)
-
-                # psisimux プロセスを終了 (MPEG-4 経路でのみ存在、PAT/PMT feed 経路とは独立)
+                # psisimux を止め、MP4 の入力待ちを解除してからフィードの完了を待つ。
                 if self._psisimux_process is not None:
                     try:
                         if self._psisimux_process.returncode is None:
@@ -1528,6 +1587,25 @@ class VideoEncodingTask:
                     except Exception as ex:
                         logging.error(f'{self.video_stream.log_prefix} Failed to terminate psisimux process:', exc_info=ex)
                     self._psisimux_process = None
+
+                if self._tsreadex_process is not None:
+                    # tsreadex が終了すると、フィードは書き込みエラーで抜けて FD を閉じる。
+                    if self._tsreadex_feed_task is not None:
+                        feed_wait_start_time = time.perf_counter()
+                        try:
+                            await asyncio.wait_for(self._tsreadex_feed_task, timeout=3.0)
+                            feed_wait_elapsed_ms = (time.perf_counter() - feed_wait_start_time) * 1000
+                            logging.debug(f'{self.video_stream.log_prefix} Feed task completed in {feed_wait_elapsed_ms:.1f}ms.')
+                        except TimeoutError:
+                            logging.warning(f'{self.video_stream.log_prefix} Feed task did not complete within timeout (3s) after tsreadex kill.')
+                        except Exception:
+                            pass
+
+                    # フィードを開始できなかった場合は、ここで書き込み側 FD を閉じる。
+                    if offline_session is None:
+                        self.__closeTSReadExInputPipe()
+                    else:
+                        await asyncio.to_thread(self.__closeTSReadExInputPipe)
 
                 # この時点で video_pid と audio_pid が取得できていない場合、正常にエンコード済み TS が出力されていないと考えられるため、
                 # エンコーダー起動をリトライする
@@ -1561,6 +1639,8 @@ class VideoEncodingTask:
                         # 最後の失敗試行についても、debug_encoder の設定に関係なく stderr を警告ログとして出力する
                         if current_encoder_stderr_lines is not None:
                             DumpEncoderStderr(current_encoder_stderr_lines, is_warning = True)
+                        if offline_session is not None:
+                            raise RuntimeError('Failed to initialize offline video/audio streams.')
                         break
 
                 # 正常に最終セグメントまでエンコードできたか途中でキャンセルされたと考えられるため、リトライループを抜ける
@@ -1594,7 +1674,9 @@ class VideoEncodingTask:
             ## 後続の os.close() を呼んでもイベントループ (メインスレッド) が固まらない状態を作れる
 
             # エンコーダープロセス
-            if self._encoder_process is not None:
+            if self._encoder_process is not None and (
+                self._encoder_process.returncode is None or offline_session is not None
+            ):
                 try:
                     if self._encoder_process.returncode is None:
                         self._encoder_process.kill()
@@ -1623,8 +1705,7 @@ class VideoEncodingTask:
                 except Exception as ex:
                     logging.error(f'{self.video_stream.log_prefix} Failed to terminate tsreadex process in final cleanup:', exc_info=ex)
 
-            # psisimux プロセス
-            ## MP4 形式の録画ファイルを処理するときだけ起動されるツールで、tsreadex への入力経路とは独立している
+            # psisimux を停止して MP4 の読み取り待ちを解除する。
             if self._psisimux_process is not None:
                 try:
                     if self._psisimux_process.returncode is None:
@@ -1640,8 +1721,8 @@ class VideoEncodingTask:
 
             # フィードタスクの完了を待つ
             ## ここに到達した時点で既にエンコーダーと tsreadex の終了待機 (asyncio.wait_for()) が完了している
-            ## そのためワーカースレッドは BrokenPipeError 経由で自身の finally に入っており、
-            ## イベントループ (メインスレッド) からこの後 os.close() を呼んでも固まる懸念はない状態にある
+            ## 入力ファイルの read() が止まっている場合は残り得るため、待機には期限を設ける。
+            ## RAM 保存の入力ファイルはワーカー自身が閉じ、読み取り待ちで実行枠の返却を遅らせない。
             if self._tsreadex_feed_task is not None:
                 feed_wait_start_time = time.perf_counter()
                 try:
@@ -1658,19 +1739,22 @@ class VideoEncodingTask:
             ## なお、create_subprocess_exec() がフィードタスクの作成前に失敗したケースでは、
             ## __registerTSReadExInputPipe() で登録した FD が残ったままになるので、
             ## self._tsreadex_feed_task の有無に関わらず必ず呼んでおく必要がある (FD リーク防止のため)
-            await asyncio.to_thread(self.__closeTSReadExInputPipe)
+            if offline_session is None:
+                self.__closeTSReadExInputPipe()
+            else:
+                await asyncio.to_thread(self.__closeTSReadExInputPipe)
 
-            # 録画ファイルを閉じる
-            ## ワーカースレッドが file.read() の実行中に file.close() を呼ぶと ValueError になるが、
-            ## 通常はここに到達した時点でフィードタスクの asyncio.wait_for() が完了しているので問題ない
-            ## 上の asyncio.wait_for() がタイムアウトしてワーカースレッドが file.read() のままになっているケースについては、
-            ## FeedTSStream() 側で ValueError を捕捉して正常終了として扱うようにしてある
+            # 通常配信の録画ファイルを閉じる (RAM 保存ではワーカーが所有する)
+            ## 通常配信は従来どおりフィードの終了待ちの後で閉じる。
+            ## RAM 保存では別スレッドから close() を待つと read() の内部ロックで回収が止まるため、ここでは閉じない。
             if file is not None:
-                await asyncio.to_thread(file.close)
+                file.close()
 
             # キャンセルで終わった旧タスクでも、既に読み終えた入力 TS 範囲のキーフレームは次回シークに使える
             ## フィードタスク終了後なら collected_input_key_frames は増えないため、ここで残りをまとめて保存する
-            await FlushCollectedSegmentMap(is_force = True)
+            ## RAM 保存のキャンセルでは、DB の追加更新よりもセッションと実行枠の回収を優先する
+            if offline_session is None or not self._is_cancelled:
+                await FlushCollectedSegmentMap(is_force = True)
 
             # 参照のクリア (GC を遅らせないため明示的に None を代入)
             self._encoder_process = None
@@ -1678,12 +1762,16 @@ class VideoEncodingTask:
             self._tsreadex_feed_task = None
             logging.debug(f'{self.video_stream.log_prefix} Final cleanup completed.')
 
-            # このエンコードタスクがキャンセルされている場合は何もしない
-            # 最後のセグメントが完了していない場合は、現在のバッファを future にセット
-            if offline_session is None and not self._is_cancelled and not current_segment.encoded_segment_ts_future.done():
-                current_segment.encoded_segment_ts_future.set_result(bytes(encoded_segment))
-                current_segment.encode_status = 'Completed'
-                logging.info(f'{self.video_stream.log_prefix}[Segment {current_sequence}] Successfully Encoded Final HLS Segment.')
+            if offline_session is None:
+                # キャンセル時は、最後のバッファを公開せずに終了する。
+                if self._is_cancelled is True:
+                    return
+
+                # 最後のセグメントが完了していない場合は、現在のバッファを future にセット
+                if not current_segment.encoded_segment_ts_future.done():
+                    current_segment.encoded_segment_ts_future.set_result(bytes(encoded_segment))
+                    current_segment.encode_status = 'Completed'
+                    logging.info(f'{self.video_stream.log_prefix}[Segment {current_sequence}] Successfully Encoded Final HLS Segment.')
 
             # エンコードタスクでのすべての処理を完了した
             self._is_finished = True

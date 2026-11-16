@@ -454,7 +454,7 @@ async def VideoOfflineSessionCreateAPI(
     response: Response,
 ) -> OfflineVideoSessionInfo:
     """オフライン保存用の RAM セッションを登録する。"""
-    session, is_created = await OfflineVideoSession.create(session_id, recorded_program, quality, stream_quality)
+    session, is_created = OfflineVideoSession.create(session_id, recorded_program, quality, stream_quality)
     response.headers['Cache-Control'] = 'no-store'
     if not is_created:
         response.status_code = status.HTTP_200_OK

@@ -19,7 +19,7 @@ from app.models.RecordedProgram import RecordedProgram
 from app.models.RecordedVideo import RecordedVideo
 from app.schemas import OfflineVideoSessionInfo, OfflineVideoSessionStreamMetadata
 from app.streams.StreamEncodingOptions import StreamQualityWithOptions
-from app.streams.VideoStream import VideoStream, VideoStreamSegment
+from app.streams.VideoStream import VideoStream
 
 
 OFFLINE_VIDEO_STREAM_SEMAPHORE = asyncio.Semaphore(3)
@@ -51,7 +51,6 @@ class OfflineVideoSession:
         recorded_program: RecordedProgram,
         quality: str,
         stream_quality: StreamQualityWithOptions,
-        file_identity: tuple[int, int, int, int, int],
     ) -> None:
         """
         Args:
@@ -59,24 +58,22 @@ class OfflineVideoSession:
             recorded_program (RecordedProgram): 作成時点の録画情報
             quality (str): 追加オプションを含む要求画質
             stream_quality (StreamQualityWithOptions): エンコーダーへ渡す画質
-            file_identity (tuple[int, int, int, int, int]): 照合済みファイルの stat 情報
         """
         self.session_id = session_id
         self._recorded_program = recorded_program
         self._stream_quality = stream_quality
-        self._file_identity = file_identity
+        # 実ファイルの照合は最初の GET で行い、以後の接続と正常終端で比較する。
+        self._file_identity: tuple[int, int, int, int, int] | None = None
         self.info = OfflineVideoSessionInfo(
             video_id = recorded_program.id,
             file_hash = recorded_program.recorded_video.file_hash,
             quality = quality,
             duration_seconds = recorded_program.recorded_video.duration,
             generation_token = secrets.token_hex(16),
-            lease_timeout_seconds = self.LEASE_TIMEOUT,
-            max_segment_bytes = self.MAX_SEGMENT_BYTES,
         )
 
-        # 同じ Future をエンコーダーと送信側で共有する。送信中は ACK 後も参照数を数える。
-        self._retained: dict[int, VideoStreamSegment] = {}
+        # 確定した TS と再生時間を再送にも使う。送信中は ACK 後も参照数を数える。
+        self._retained: dict[int, tuple[bytes, float]] = {}
         self._sending: dict[int, int] = {}
         self._retained_bytes = 0
         self._acked_next = 0
@@ -96,31 +93,25 @@ class OfflineVideoSession:
         self._renewLease()
 
     @classmethod
-    async def create(
+    def create(
         cls,
         session_id: str,
         recorded_program: RecordedProgram,
         quality: str,
         stream_quality: StreamQualityWithOptions,
     ) -> tuple[OfflineVideoSession, bool]:
-        """ファイルを照合し、同じ保存 ID の並行作成を一つの登録にまとめる。"""
+        """録画情報と画質を確認し、同じ保存 ID の並行作成を一つの登録にまとめる。"""
         recorded_video = recorded_program.recorded_video
         if recorded_video.status != 'Recorded':
             raise OfflineVideoSessionError(409, 'recording_unavailable')
 
-        # ハッシュ確認の前後で空き枠を確認する。登録の直前には await を挟まない。
-        if session_id not in cls._sessions and len(cls._sessions) >= cls.MAX_SESSIONS:
-            raise OfflineVideoSessionError(429, 'session_capacity', retry_after=5)
-        file_identity = await asyncio.to_thread(cls._getFileIdentity, recorded_video)
-        if file_identity is None:
-            raise OfflineVideoSessionError(409, 'recording_changed')
-
+        # ファイル I/O や await を挟まず、上限確認と登録を一度に行う。
         existing = cls._sessions.get(session_id)
         if existing is not None:
             existing._validateTarget(recorded_program.id, quality)
             if existing._recordingFields(recorded_video) != existing._recordingFields(existing._recorded_program.recorded_video):
                 raise OfflineVideoSessionError(409, 'recording_changed')
-            if existing._file_identity != file_identity or existing._stream_quality != stream_quality:
+            if existing._stream_quality != stream_quality:
                 raise OfflineVideoSessionError(409, 'session_mismatch')
             if existing.is_closed:
                 raise OfflineVideoSessionError(429, 'session_capacity', retry_after=5)
@@ -128,7 +119,7 @@ class OfflineVideoSession:
         if len(cls._sessions) >= cls.MAX_SESSIONS:
             raise OfflineVideoSessionError(429, 'session_capacity', retry_after=5)
 
-        session = cls(session_id, recorded_program, quality, stream_quality, file_identity)
+        session = cls(session_id, recorded_program, quality, stream_quality)
         cls._sessions[session_id] = session
         return session, True
 
@@ -213,15 +204,19 @@ class OfflineVideoSession:
                 pass
         return False
 
-    def publishSegment(self, segment: VideoStreamSegment, data: bytearray, duration_seconds: float) -> None:
-        """一度だけ bytes に変換し、送信と再送が共有する Future に格納する。"""
-        assert segment.sequence_index == self._produced_next
+    def publishSegment(self, sequence: int, data: bytearray, duration_seconds: float) -> None:
+        """
+        一度だけ bytes に変換し、送信と再送が参照するデータを確定する。
+
+        Args:
+            sequence (int): 確定するセグメントの連続番号
+            data (bytearray): エンコード済み TS
+            duration_seconds (float): セグメントの再生時間
+        """
+        assert sequence == self._produced_next
         assert 0 < len(data) <= self.MAX_SEGMENT_BYTES
         assert self._retained_bytes + len(data) <= self.RETAINED_BYTES_LIMIT
-        segment.duration_seconds = duration_seconds
-        segment.encoded_segment_ts_future.set_result(bytes(data))
-        segment.encode_status = 'Completed'
-        self._retained[self._produced_next] = segment
+        self._retained[sequence] = (bytes(data), duration_seconds)
         self._retained_bytes += len(data)
         self._produced_next += 1
         self._changed.set()
@@ -245,17 +240,17 @@ class OfflineVideoSession:
             segment = self._retained.get(sequence)
             if segment is not None:
                 # ASGI send の完了を待つ間に ACK が届いても、本体への参照を予算に含める。
-                data = segment.encoded_segment_ts_future.result()
+                data, duration_seconds = segment
                 self._sending[sequence] = self._sending.get(sequence, 0) + 1
                 try:
-                    header = struct.pack('>III', sequence, max(1, round(segment.duration_seconds * 1000)), len(data))
+                    header = struct.pack('>III', sequence, max(1, round(duration_seconds * 1000)), len(data))
                     await send({'type': 'http.response.body', 'body': header, 'more_body': True})
                     if self._close_task is not None or connection_id != self._connection_id:
                         return
                     self._offered_next = max(self._offered_next, sequence + 1)
                     await send({'type': 'http.response.body', 'body': data, 'more_body': True})
                 finally:
-                    del data
+                    del data, segment
                     self._sending[sequence] -= 1
                     if self._sending[sequence] == 0:
                         del self._sending[sequence]
@@ -327,11 +322,8 @@ class OfflineVideoSession:
         self._lease_timer = loop.call_at(self._lease_deadline, self.close)
 
     def _releaseSegment(self, sequence: int) -> None:
-        segment = self._retained.pop(sequence)
-        self._retained_bytes -= len(segment.encoded_segment_ts_future.result())
-        # VideoStream 側のセグメント情報からも bytes への参照を外す。
-        segment.encoded_segment_ts_future = asyncio.get_running_loop().create_future()
-        segment.encoded_segment_ts_future.set_result(b'')
+        data, _ = self._retained.pop(sequence)
+        self._retained_bytes -= len(data)
 
     @staticmethod
     def _recordingFields(video: RecordedVideo) -> tuple[int, str, str, int, datetime]:
@@ -364,6 +356,10 @@ class OfflineVideoSession:
         if self._recordingFields(recorded_program.recorded_video) != self._recordingFields(self._recorded_program.recorded_video):
             return False
         file_identity = await asyncio.to_thread(self._getFileIdentity, recorded_program.recorded_video)
+        if file_identity is None:
+            return False
+        if self._file_identity is None:
+            self._file_identity = file_identity
         return self._file_identity == file_identity
 
     async def _encode(self) -> None:
@@ -392,10 +388,10 @@ class OfflineVideoSession:
     async def _cleanup(self) -> None:
         try:
             if self._encoding_task is not None and not self._encoding_task.done():
-                if self._stream is None:
-                    self._encoding_task.cancel()
-                else:
+                if self._stream is not None:
                     self._stream.cancelOfflineEncoding()
+                # 入力位置の探索や DB の待機も中断し、エンコード側の finally で資源を回収する。
+                self._encoding_task.cancel()
                 await asyncio.gather(self._encoding_task, return_exceptions=True)
             while self._sending:
                 self._changed.clear()

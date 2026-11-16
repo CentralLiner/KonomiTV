@@ -58,7 +58,7 @@ def pytest_configure(config: pytest.Config) -> None:
         config (pytest.Config): pytest の設定
     """
 
-    # Windows では本番と同じく、子プロセスを利用できるイベントループを使う。
+    # Aerich の import が Windows のループを Selector に変更するため、子プロセスを使える Proactor に戻す。
     if sys.platform == 'win32':
         asyncio.set_event_loop_policy(asyncio.WindowsProactorEventLoopPolicy())
 

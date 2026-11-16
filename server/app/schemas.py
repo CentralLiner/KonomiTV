@@ -255,8 +255,6 @@ class OfflineVideoStreamMetadata(BaseModel):
 class OfflineVideoSessionInfo(OfflineVideoStreamMetadata):
     protocol_version: Literal[2] = 2
     generation_token: str
-    lease_timeout_seconds: int
-    max_segment_bytes: int
 
 class OfflineVideoSessionStreamMetadata(OfflineVideoSessionInfo):
     session_id: str

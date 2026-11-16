@@ -401,22 +401,6 @@ class VideoStream:
         self._video_encoding_task.cancel()
 
 
-    def getOfflineEncodingSegment(self, sequence: int) -> VideoStreamSegment:
-        """
-        RAM 保存用の出力先を取得し、予定件数を超えた場合は末尾を伸ばす。
-
-        Args:
-            sequence (int): 生成するセグメント番号
-
-        Returns:
-            VideoStreamSegment: エンコード結果を格納する Future を持つセグメント
-        """
-        assert self.offline_session is not None
-        if sequence == len(self._segments):
-            self._segments.append(self._createSegment(sequence, self._segment_duration_seconds))
-        return self._segments[sequence]
-
-
     @property
     def segment_duration_seconds(self) -> float:
         """フレームレートから算出した通常セグメント長を返す。"""
@@ -459,34 +443,20 @@ class VideoStream:
                 playlist_start_seconds = segment_sequence * self._segment_duration_seconds
                 remaining_duration = self.recorded_program.recorded_video.duration - playlist_start_seconds
                 duration_seconds = min(self._segment_duration_seconds, max(remaining_duration, 0.001))
-                self._segments.append(self._createSegment(segment_sequence, duration_seconds))
+                self._segments.append(VideoStreamSegment(
+                    sequence_index = segment_sequence,
+                    playlist_start_seconds = playlist_start_seconds,
+                    source_file_position = None,
+                    source_start_dts = None,
+                    duration_seconds = duration_seconds,
+                    encode_status = 'Pending',
+                    encoded_segment_ts_future = asyncio.Future(),
+                ))
 
             logging.info(
                 f'{self.log_prefix} Total {len(self._segments)} virtual segments '
                 f'(segment_duration: {self._segment_duration_seconds:.6f}s).'
             )
-
-
-    def _createSegment(self, sequence: int, duration_seconds: float) -> VideoStreamSegment:
-        """
-        仮想区間と結果格納用の Future を作る。
-
-        Args:
-            sequence (int): セグメント番号
-            duration_seconds (float): 計画上の再生時間 (秒)
-
-        Returns:
-            VideoStreamSegment: 生成待ちのセグメント
-        """
-        return VideoStreamSegment(
-            sequence_index = sequence,
-            playlist_start_seconds = sequence * self._segment_duration_seconds,
-            source_file_position = None,
-            source_start_dts = None,
-            duration_seconds = duration_seconds,
-            encode_status = 'Pending',
-            encoded_segment_ts_future = asyncio.get_running_loop().create_future(),
-        )
 
 
     def getVirtualPlaylist(self, cache_key: str | None = None, audio: Literal['primary', 'secondary'] = 'primary') -> str:
