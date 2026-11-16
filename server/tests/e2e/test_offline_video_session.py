@@ -3,15 +3,17 @@
 import asyncio
 import struct
 import uuid
+from collections import Counter
 from collections.abc import AsyncGenerator
 from datetime import datetime
 from pathlib import Path
 
 import httpx2 as httpx
 import pytest
+from biim.mpeg2ts import ts
 from starlette.types import Message
 
-from app.constants import JST
+from app.constants import JST, QUALITY_TYPES
 from app.metadata.MetadataAnalyzer import MetadataAnalyzer
 from app.models.RecordedProgram import RecordedProgram
 from app.models.RecordedVideo import RecordedVideo
@@ -19,6 +21,7 @@ from app.streams.OfflineVideoSession import (
     OFFLINE_VIDEO_STREAM_SEMAPHORE,
     OfflineVideoSession,
 )
+from app.streams.VideoEncodingTask import VideoEncodingTask
 from app.streams.VideoStream import VideoStream
 from tests.conftest import FIXTURES_DIR
 
@@ -116,6 +119,60 @@ async def test_offline_video_session_replays_the_same_output(
     assert replacement.status_code == 201
     assert replacement.json()['generation_token'] != created.json()['generation_token']
     assert (await client.delete(url, headers=headers)).status_code == 409
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(('quality', 'frame_rate', 'frame_count'), [
+    ('1080p-60fps', 60000, 361),
+    ('720p', 30000, 181),
+    ('540p-24fps', 24000, 145),
+])
+async def test_offline_video_session_keeps_final_boundary_frame_with_audio(
+    client: httpx.AsyncClient,
+    recording: tuple[int, Path],
+    monkeypatch: pytest.MonkeyPatch,
+    quality: str,
+    frame_rate: int,
+    frame_count: int,
+) -> None:
+    """分割境界にある最終フレームを、主音声・副音声と同じ末尾セグメントに保持する。"""
+    original_build = VideoEncodingTask.buildFFmpegOptions
+
+    def BuildWithFinalKeyFrame(task: VideoEncodingTask, quality: QUALITY_TYPES, output_ts_offset: float) -> list[str]:
+        options = original_build(task, quality, output_ts_offset)
+        # 実録画を最後まで読み、6.006 秒の分割境界に最後のキーフレームを配置する。
+        options[options.index('-vf') + 1] += f',fps={frame_rate}/1001,trim=end_frame={frame_count},setpts=PTS-STARTPTS'
+        options[options.index('-af') + 1] += f',asetpts=PTS-STARTPTS,atrim=duration={frame_count * 1001 / frame_rate}'
+        if '-r' in options:
+            rate_index = options.index('-r')
+            del options[rate_index:rate_index + 2]
+        options[-1:-1] = ['-sc_threshold', '0', '-force_key_frames', f'expr:eq(n,{frame_count - 1})', '-fps_mode', 'passthrough']
+        return options
+
+    monkeypatch.setattr(VideoEncodingTask, 'buildFFmpegOptions', BuildWithFinalKeyFrame)
+    video_id, _ = recording
+    url = f'/api/streams/video/{video_id}/{quality}/offline-sessions/{uuid.uuid4().hex}'
+    created = await client.put(url)
+    assert created.status_code == 201
+    headers = {'X-KonomiTV-Offline-Generation': created.json()['generation_token']}
+
+    response = await client.get(f'{url}?connection_id=1&next_sequence=0', headers=headers)
+    assert response.status_code == 200
+    segments, count = ReadSegments(response.content)
+    assert len(segments) == count == 1
+
+    # FFmpeg の既定 PID ごとに数え、最終フレームと両音声が同じセグメントに含まれることを確かめる。
+    packet_counts: Counter[int] = Counter()
+    video_frames = 0
+    for offset in range(0, len(segments[0]), ts.PACKET_SIZE):
+        packet = segments[0][offset:offset + ts.PACKET_SIZE]
+        pid = ts.pid(packet)
+        packet_counts[pid] += 1
+        if pid == 0x100 and ts.payload_unit_start_indicator(packet):
+            video_frames += 1
+    assert video_frames == frame_count
+    assert packet_counts[0x101] > 0
+    assert packet_counts[0x102] > 0
 
 
 @pytest.mark.asyncio

@@ -1113,24 +1113,40 @@ class VideoEncodingTask:
                     if self._is_cancelled is True:
                         break
 
-                    # エンコーダーの出力読み取りタイムアウトをチェック
-                    current_time = asyncio.get_running_loop().time()
-                    if current_time - last_read_time > read_timeout:
-                        if offline_session is not None:
-                            raise TimeoutError('Encoder output read timeout.')
-                        logging.warning(f'{self.video_stream.log_prefix}[Segment {current_sequence}] Encoder output read timeout.')
-                        break
-
-                    # 実際の stdout 待ちにも期限を設ける。容量確保はこの区間の外で行う。
+                    # RAM 保存では stdout の読み取り待ちだけに期限を設け、容量確保や DB 保存はこの区間の外で行う。
                     try:
-                        async with asyncio.timeout(read_timeout):
-                            packet = await encoder_stdout.readexactly(ts.PACKET_SIZE)
-                        last_read_time = asyncio.get_running_loop().time()
-                    except TimeoutError:
-                        if offline_session is not None:
-                            raise
-                        logging.warning(f'{self.video_stream.log_prefix}[Segment {current_sequence}] Encoder output read timeout.')
-                        break
+                        if offline_session is None:
+                            # 通常再生と Background Fetch は、従来どおり前回の読み取り開始からの経過時間で判定する。
+                            current_time = asyncio.get_running_loop().time()
+                            if current_time - last_read_time > read_timeout:
+                                logging.warning(f'{self.video_stream.log_prefix}[Segment {current_sequence}] Encoder output read timeout.')
+                                break
+                            # 同期バイトを探す (通常配信の読み取り手順は変更しない)
+                            isEOF = False
+                            while True:
+                                try:
+                                    if self._encoder_process is None:
+                                        break
+                                    sync_byte = await self._encoder_process.stdout.readexactly(1)
+                                    if sync_byte == ts.SYNC_BYTE:
+                                        break
+                                    elif sync_byte == b'':
+                                        isEOF = True
+                                        break
+                                except asyncio.IncompleteReadError:
+                                    isEOF = True
+                                break
+                            if isEOF:
+                                break
+
+                            # TS パケットを読み込む
+                            if self._encoder_process is None:
+                                break
+                            packet = ts.SYNC_BYTE + await self._encoder_process.stdout.readexactly(ts.PACKET_SIZE - 1)
+                            last_read_time = current_time  # 正常に読み取れた場合はタイムアウトをリセット
+                        else:
+                            async with asyncio.timeout(read_timeout):
+                                packet = await encoder_stdout.readexactly(ts.PACKET_SIZE)
                     except asyncio.IncompleteReadError as ex:
                         if offline_session is None or self._is_cancelled:
                             break
@@ -1329,7 +1345,8 @@ class VideoEncodingTask:
                                             is_split_pending = True
 
                                 # 無事セグメントを安全に分割できる地点に到達したので、現在のセグメントを確定
-                                if is_should_finalize_now and (offline_session is None or offline_segment_has_video):
+                                # EOF では音声の追加が完了しているため、最後の映像は現在のセグメントへ含める。
+                                if not is_output_eof and is_should_finalize_now and (offline_session is None or offline_segment_has_video):
                                     if offline_session is not None:
                                         assert offline_segment_start_pts is not None
                                         offline_session.publishSegment(
