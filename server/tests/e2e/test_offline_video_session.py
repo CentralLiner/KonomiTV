@@ -3,7 +3,6 @@
 import asyncio
 import concurrent.futures
 import errno
-import inspect
 import io
 import os
 import struct
@@ -11,10 +10,10 @@ import sys
 import threading
 import uuid
 from collections import Counter
-from collections.abc import AsyncGenerator, Awaitable, Callable
+from collections.abc import AsyncGenerator, Callable
 from datetime import datetime
 from pathlib import Path
-from types import FunctionType
+from types import SimpleNamespace
 from typing import Any
 
 import anyio
@@ -209,6 +208,65 @@ async def test_offline_video_session_replays_after_recording_io_error(
         ReadSegments(interrupted.content)
     end = await client.get(f'{url}?connection_id=5&next_sequence={count}', headers=headers)
     assert ReadSegments(end.content) == ([], count)
+
+
+@pytest.mark.asyncio
+async def test_offline_video_session_cancels_gets_waiting_for_recording_check(
+    client: httpx.AsyncClient,
+    recording: tuple[int, Path],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """同時の GET は照合を共有し、DELETE 後も停止した I/O は復帰まで枠を占有する。"""
+    video_id, _ = recording
+    url = f'/api/streams/video/{video_id}/240p/offline-sessions/{uuid.uuid4().hex}'
+    created = await client.put(url)
+    assert created.status_code == 201
+    headers = {'X-KonomiTV-Offline-Generation': created.json()['generation_token']}
+
+    loop = asyncio.get_running_loop()
+    started: asyncio.Queue[None] = asyncio.Queue()
+    release = threading.Event()
+    original_matches = MetadataAnalyzer.matchesFileHash
+
+    def MatchWithStalledRead(analyzer: MetadataAnalyzer, file_hash: str) -> bool:
+        # NAS が一時的に応答しない状況を、録画ハッシュの読み取りで再現する。
+        matches = original_matches(analyzer, file_hash)
+        loop.call_soon_threadsafe(started.put_nowait, None)
+        assert release.wait(10)
+        return matches
+
+    monkeypatch.setattr(MetadataAnalyzer, 'matchesFileHash', MatchWithStalledRead)
+    monkeypatch.setattr(OfflineVideoSession, '_file_io_slots', asyncio.Semaphore(1))
+    requests = [
+        asyncio.create_task(client.get(f'{url}?connection_id={connection_id}&next_sequence=0', headers=headers))
+        for connection_id in (1, 2)
+    ]
+    next_url = f'/api/streams/video/{video_id}/240p/offline-sessions/{uuid.uuid4().hex}'
+    next_headers = {}
+    try:
+        await asyncio.wait_for(started.get(), timeout=5)
+        with pytest.raises(TimeoutError):
+            await asyncio.wait_for(started.get(), timeout=0.2)
+        deleted = await asyncio.wait_for(client.delete(url, headers=headers), timeout=2)
+        assert deleted.status_code == 204
+        done, pending = await asyncio.wait(requests, timeout=2)
+        assert not pending
+        assert all(response.result().status_code == 410 for response in done)
+
+        # RAM セッションは新しく作れても、停止した読み取りが復帰するまで次の照合は待機する。
+        next_created = await client.put(next_url)
+        assert next_created.status_code == 201
+        next_headers = {'X-KonomiTV-Offline-Generation': next_created.json()['generation_token']}
+        requests.append(asyncio.create_task(client.get(f'{next_url}?connection_id=1&next_sequence=0', headers=next_headers)))
+        with pytest.raises(TimeoutError):
+            await asyncio.wait_for(started.get(), timeout=0.2)
+        release.set()
+        await asyncio.wait_for(started.get(), timeout=5)
+    finally:
+        release.set()
+        if next_headers:
+            await asyncio.wait_for(client.delete(next_url, headers=next_headers), timeout=5)
+        await asyncio.gather(*requests, return_exceptions=True)
 
 
 @pytest.mark.asyncio
@@ -485,7 +543,7 @@ async def test_offline_video_session_reconnects_while_waiting_for_capacity(
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize('waiting_for', ['SourcePosition', 'SegmentCapacity', 'SegmentMapSave', 'BeforePipeRegistration', 'AfterPipeRegistration'])
+@pytest.mark.parametrize('waiting_for', ['SourcePosition', 'SegmentCapacity', 'SegmentMapSave', 'PipeRegistration'])
 async def test_offline_video_session_cancels_pending_encoding(
     client: httpx.AsyncClient,
     recording: tuple[int, Path],
@@ -535,16 +593,12 @@ async def test_offline_video_session_cancels_pending_encoding(
         return pipe
 
     async def DelayPipeRegistration[T](func: Callable[..., T], /, *args: Any, **kwargs: Any) -> T:
-        if func.__name__ == '__registerTSReadExInputPipe':
-            # 登録前と登録後の両方で、所有権の受け渡し中にキャンセルする。
-            if waiting_for == 'AfterPipeRegistration':
-                result = await original_to_thread(func, *args, **kwargs)
-                waiting.set()
-                await release.wait()
-                return result
+        result = await original_to_thread(func, *args, **kwargs)
+        # 書き込み側 FD の登録が済み、呼び出し元へ結果を返す直前で待つ。
+        if len(args) == 1 and args[0] in pipe_fds[1::2]:
             waiting.set()
             await release.wait()
-        return await original_to_thread(func, *args, **kwargs)
+        return result
 
     if waiting_for == 'SourcePosition':
         monkeypatch.setattr(VideoStream, 'resolveSegmentSourcePosition', ResolveWithDelay)
@@ -605,37 +659,32 @@ async def test_offline_video_session_closes_input_pipe_on_cancel_during_cleanup(
     Returns:
         None
     """
-    loop = asyncio.get_running_loop()
-    queued_feed: asyncio.Future[bool] = loop.create_future()
-    waiting_for_feed = asyncio.Event()
+    closing_input = asyncio.Event()
+    allow_close = asyncio.Event()
     pipe_fd: int | None = None
-    original_run_in_executor = loop.run_in_executor
+    original_file_io = OfflineVideoSession.runFileIO
     original_to_thread = anyio.to_thread.run_sync
-    original_wait_for = asyncio.wait_for
 
-    async def TrackRegistration[T](func: Callable[..., T], /, *args: Any, **kwargs: Any) -> T:
+    async def TrackInputPipe[T](func: Callable[..., T], /, *args: Any, **kwargs: Any) -> T:
         nonlocal pipe_fd
-        if func.__name__ == '__registerTSReadExInputPipe':
+        if len(args) == 1 and type(args[0]) is int:
             pipe_fd = args[0]
+        if func.__name__ == 'CloseOfflineInput':
+            closing_input.set()
+            await allow_close.wait()
         return await original_to_thread(func, *args, **kwargs)
 
-    def QueueFeed(executor: concurrent.futures.Executor | None, func: Callable[..., Any], *args: Any) -> asyncio.Future[Any]:
+    async def QueueFeed[T](func: Callable[..., T], *args: Any) -> T:
         # 入力ワーカーが使用中で、フィードがまだキューにある状態を作る。
-        if isinstance(func, FunctionType) and func.__name__ == 'FeedTSStream':
-            return queued_feed
-        return original_run_in_executor(executor, func, *args)
-
-    async def WaitFor[T](awaitable: Awaitable[T], timeout: float | None) -> T:
-        if awaitable is queued_feed:
-            waiting_for_feed.set()
-        return await original_wait_for(awaitable, timeout)
+        if pipe_fd is not None and args and args[0] == pipe_fd:
+            await asyncio.Future()
+        return await original_file_io(func, *args)
 
     async def FailEncoding(session: OfflineVideoSession, encoder: asyncio.subprocess.Process) -> bool:
         raise RuntimeError('Encoder failed before the input worker started.')
 
-    monkeypatch.setattr(anyio.to_thread, 'run_sync', TrackRegistration)
-    monkeypatch.setattr(loop, 'run_in_executor', QueueFeed)
-    monkeypatch.setattr(asyncio, 'wait_for', WaitFor)
+    monkeypatch.setattr(anyio.to_thread, 'run_sync', TrackInputPipe)
+    monkeypatch.setattr(OfflineVideoSession, 'runFileIO', staticmethod(QueueFeed))
     monkeypatch.setattr(OfflineVideoSession, 'waitForCapacity', FailEncoding)
 
     video_id, _ = recording
@@ -644,13 +693,21 @@ async def test_offline_video_session_closes_input_pipe_on_cancel_during_cleanup(
     assert created.status_code == 201
     headers = {'X-KonomiTV-Offline-Generation': created.json()['generation_token']}
     response_task = asyncio.create_task(client.get(f'{url}?connection_id=1&next_sequence=0', headers=headers))
+    delete_task: asyncio.Task[httpx.Response] | None = None
     try:
-        await asyncio.wait_for(waiting_for_feed.wait(), timeout=10)
+        await asyncio.wait_for(closing_input.wait(), timeout=10)
         assert pipe_fd is not None
-        assert (await client.delete(url, headers=headers)).status_code == 204
+        delete_task = asyncio.create_task(client.delete(url, headers=headers))
+        # DELETE が GET を終了させてから、キャンセルされたエンコードのパイプ回収を再開する。
+        await asyncio.wait_for(response_task, timeout=5)
+        allow_close.set()
+        assert (await asyncio.wait_for(delete_task, timeout=5)).status_code == 204
         with pytest.raises(OSError):
             os.fstat(pipe_fd)
     finally:
+        allow_close.set()
+        if delete_task is not None:
+            await delete_task
         await client.delete(url, headers=headers)
         await response_task
         # 修正前のコードで漏れを検出した場合も、テスト側で残った FD を閉じる。
@@ -786,20 +843,14 @@ async def test_offline_video_session_releases_slot_during_input_read(
     release_read = threading.Event()
     encoders: list[asyncio.subprocess.Process] = []
     original_wait = OfflineVideoSession.waitForCapacity
+    input_open_count = 0
 
     class StalledFile(io.FileIO):
         did_block = False
 
         def readinto(self, buffer: Any) -> int | None:
             # BufferedReader が内部ロックを保持したまま、下層の read() を待つ状況を作る。
-            frame = inspect.currentframe()
-            is_feed = False
-            while frame is not None:
-                if frame.f_code.co_name in ('FeedTSStream', 'FeedOfflineMP4Stream'):
-                    is_feed = True
-                    break
-                frame = frame.f_back
-            if not self.did_block and is_feed == (phase != 'Probe'):
+            if not self.did_block:
                 self.did_block = True
                 loop.call_soon_threadsafe(read_started.set)
                 if not release_read.wait(15):
@@ -813,35 +864,36 @@ async def test_offline_video_session_releases_slot_during_input_read(
                 loop.call_soon_threadsafe(file_closed.set)
 
     def OpenInput(file_name: str, mode: str) -> io.BufferedReader:
+        nonlocal input_open_count
         assert Path(file_name) == path and mode == 'rb'
-        return io.BufferedReader(StalledFile(file_name, mode))
+        input_open_count += 1
+        # TS は検索範囲の探索と入力の供給で別々にファイルを開く。
+        if input_open_count == (1 if phase == 'Probe' else 2):
+            return io.BufferedReader(StalledFile(file_name, mode))
+        return open(file_name, mode)
 
     async def TrackEncoder(session: OfflineVideoSession, encoder: asyncio.subprocess.Process) -> bool:
         encoders.append(encoder)
         encoder_started.set()
         return await original_wait(session, encoder)
 
+    encoding_module = sys.modules[VideoEncodingTask.__module__]
     if path.suffix == '.mp4':
-        original_fdopen = os.fdopen
+        # エンコードの入力パイプだけを、停止する BufferedReader に差し替える。
+        def OpenMP4Input(fd: int, mode: str) -> io.BufferedReader:
+            return io.BufferedReader(StalledFile(fd, mode))
 
-        def OpenMP4Input(fd: int, *args: Any, **kwargs: Any) -> Any:
-            # psisimux の読み込みパイプだけを、停止する BufferedReader に差し替える。
-            frame = inspect.currentframe()
-            caller = frame.f_back if frame is not None else None
-            if caller is not None and caller.f_code is VideoEncodingTask.run.__code__:
-                return io.BufferedReader(StalledFile(fd, 'rb'))
-            return original_fdopen(fd, *args, **kwargs)
-
-        monkeypatch.setattr(os, 'fdopen', OpenMP4Input)
+        monkeypatch.setattr(encoding_module, 'os', SimpleNamespace(**(vars(os) | {'fdopen': OpenMP4Input})))
     else:
-        monkeypatch.setattr(sys.modules[VideoEncodingTask.__module__], 'open', OpenInput, raising=False)
+        monkeypatch.setattr(encoding_module, 'open', OpenInput, raising=False)
     monkeypatch.setattr(OfflineVideoSession, 'waitForCapacity', TrackEncoder)
-    # 入力 read() 一つで既定プールを満杯にし、回収が同じプールの空きを待たないことを確認する。
-    input_executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+    # 各プールを1件に絞り、RAM 保存の read() が停止しても回収と通常の I/O が進むことを確認する。
+    monkeypatch.setattr(OfflineVideoSession, '_file_io_slots', asyncio.Semaphore(1))
+    default_executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
     original_run = loop.run_in_executor
 
     def RunWithLimitedInputPool(executor: concurrent.futures.Executor | None, func: Callable[..., Any], *args: Any) -> asyncio.Future[Any]:
-        return original_run(input_executor if executor is None else executor, func, *args)
+        return original_run(default_executor if executor is None else executor, func, *args)
 
     monkeypatch.setattr(loop, 'run_in_executor', RunWithLimitedInputPool)
     session_id = uuid.uuid4().hex
@@ -853,6 +905,7 @@ async def test_offline_video_session_releases_slot_during_input_read(
     delete_task: asyncio.Task[httpx.Response] | None = None
     try:
         await asyncio.wait_for(read_started.wait(), 5)
+        assert (await asyncio.wait_for(asyncio.to_thread(path.stat), timeout=1)).st_size > 0
         if phase != 'Probe':
             await asyncio.wait_for(encoder_started.wait(), 5)
         if phase == 'Retry':
@@ -884,7 +937,7 @@ async def test_offline_video_session_releases_slot_during_input_read(
         if read_started.is_set():
             await asyncio.wait_for(file_closed.wait(), 5)
         monkeypatch.setattr(loop, 'run_in_executor', original_run)
-        input_executor.shutdown(wait=True)
+        default_executor.shutdown(wait=True)
 
 
 @pytest.mark.asyncio
@@ -975,6 +1028,7 @@ async def test_offline_video_session_retries_probe_only_before_publication(
     published_sequences: list[int] = []
     original_build = VideoEncodingTask.buildFFmpegOptions
     original_publish = OfflineVideoSession.publishSegment
+    original_wait = OfflineVideoSession.waitForCapacity
 
     def BuildWithProbeFailure(task: VideoEncodingTask, quality: QUALITY_TYPES, output_ts_offset: float) -> list[str]:
         options = original_build(task, quality, output_ts_offset)
@@ -995,9 +1049,16 @@ async def test_offline_video_session_retries_probe_only_before_publication(
         original_publish(session, sequence, data, duration_seconds)
         published_sequences.append(sequence)
 
+    async def WaitAfterEarlyExit(session: OfflineVideoSession, encoder: asyncio.subprocess.Process) -> bool:
+        if failure == 'RetryLimit' or (failure == 'InitialProbe' and len(probe_durations) == 1):
+            # 容量判定より前に、実際の FFmpeg が音声の検出に失敗して終了した状態を作る。
+            assert await asyncio.wait_for(encoder.wait(), timeout=5) != 0
+        return await original_wait(session, encoder)
+
     monkeypatch.setattr(VideoEncodingTask, 'MAX_RETRY_COUNT', 2)
     monkeypatch.setattr(VideoEncodingTask, 'buildFFmpegOptions', BuildWithProbeFailure)
     monkeypatch.setattr(OfflineVideoSession, 'publishSegment', TrackPublication)
+    monkeypatch.setattr(OfflineVideoSession, 'waitForCapacity', WaitAfterEarlyExit)
     video_id, _ = recording
     url = f'/api/streams/video/{video_id}/240p/offline-sessions/{uuid.uuid4().hex}'
     created = await client.put(url)

@@ -319,11 +319,12 @@ class VideoStream:
 
         async with self._source_position_lock:
             file_path = Path(recorded_video.file_path)
+            run_file_io = self.offline_session.runFileIO if self.offline_session is not None else asyncio.to_thread
 
             # segment_map キャッシュから再生を開始した場合、ソース位置は即時解決できても PID 情報が未取得のままになる
             ## 再生中のキーフレーム収集は入力 TS の PES を読むため、必要になった時点で一度だけ PAT/PMT を読む
             if self._ts_stream_info is None:
-                self._ts_stream_info = await asyncio.to_thread(
+                self._ts_stream_info = await run_file_io(
                     TSKeyFrameSeeker.findStreamInfo,
                     file_path,
                 )
@@ -331,7 +332,7 @@ class VideoStream:
             # segment_map をプレイリスト時刻へ対応させるには、録画先頭の DTS が基準として必要になる
             ## ここも同一セッション内で変わらないため、未取得のときだけ読み込む
             if self._ts_source_base_dts is None:
-                self._ts_source_base_dts = await asyncio.to_thread(
+                self._ts_source_base_dts = await run_file_io(
                     TSKeyFrameSeeker.findBaseDTS,
                     file_path,
                     self._ts_stream_info,
@@ -542,6 +543,7 @@ class VideoStream:
 
             recorded_video = self.recorded_program.recorded_video
             file_path = Path(recorded_video.file_path)
+            run_file_io = self.offline_session.runFileIO if self.offline_session is not None else asyncio.to_thread
 
             if recorded_video.container_format == 'MPEG-TS':
                 # segment_map は再生開始位置のキャッシュなので、見つかればファイル I/O なしで即座に使う
@@ -558,18 +560,18 @@ class VideoStream:
 
                 # PAT/PMT と先頭 DTS は同一視聴セッション内で変わらないため、最初の探索時だけ読む
                 if self._ts_stream_info is None:
-                    self._ts_stream_info = await asyncio.to_thread(
+                    self._ts_stream_info = await run_file_io(
                         TSKeyFrameSeeker.findStreamInfo,
                         file_path,
                     )
                 if self._ts_source_base_dts is None:
-                    self._ts_source_base_dts = await asyncio.to_thread(
+                    self._ts_source_base_dts = await run_file_io(
                         TSKeyFrameSeeker.findBaseDTS,
                         file_path,
                         self._ts_stream_info,
                     )
 
-                source_position = await asyncio.to_thread(
+                source_position = await run_file_io(
                     TSKeyFrameSeeker.seek,
                     file_path,
                     self._ts_stream_info,
@@ -598,7 +600,7 @@ class VideoStream:
 
             # MP4 は moov 内テーブルから同期サンプル DTS を短時間で復元できるため、DB キャッシュを作らない
             if self._mp4_keyframe_dts_list is None:
-                self._mp4_keyframe_dts_list = await asyncio.to_thread(
+                self._mp4_keyframe_dts_list = await run_file_io(
                     MP4KeyFrameParser.readVideoKeyFrameDTS,
                     file_path,
                 )

@@ -100,6 +100,7 @@ app.add_middleware(
     allow_methods = ['*'],
     allow_headers = ['*'],
     # 録画 TS の直接再生でクライアントが Range 応答の開始位置と総ファイルサイズを検証するため必要なヘッダーを許可
+    # オフライン保存の枠を待つクライアントには、再要求までの時間も通知する。
     expose_headers = ['Accept-Ranges', 'Content-Length', 'Content-Range', 'ETag', 'Last-Modified', 'Retry-After'],
     allow_credentials = True,
 )
