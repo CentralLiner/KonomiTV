@@ -145,6 +145,9 @@ const refreshActiveJobProgress = async (): Promise<void> => {
 
             // 非同期取得の途中で Waiting を画面へ反映せず、受信量と状態を確定してからまとめて更新する
             let nextDownloadedBytes = latestJob.downloaded_bytes;
+            if (latestJob.background_fetch_id !== null) {
+                nextDownloadedBytes = Math.max(job.downloaded_bytes, nextDownloadedBytes);
+            }
             let nextState = latestJob.state;
 
             // Background Fetch 中はブラウザ側の受信量の方が進んでいることが多い

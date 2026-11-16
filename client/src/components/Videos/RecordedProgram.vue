@@ -121,7 +121,7 @@
                     <path fill="currentColor" d="M7 3h2a1 1 0 0 0-2 0M6 3a2 2 0 1 1 4 0h4a.5.5 0 0 1 0 1h-.564l-1.205 8.838A2.5 2.5 0 0 1 9.754 15H6.246a2.5 2.5 0 0 1-2.477-2.162L2.564 4H2a.5.5 0 0 1 0-1zm1 3.5a.5.5 0 0 0-1 0v5a.5.5 0 0 0 1 0zM9.5 6a.5.5 0 0 0-.5.5v5a.5.5 0 0 0 1 0v-5a.5.5 0 0 0-.5-.5"></path>
                 </svg>
             </div>
-            <div v-if="!forOffline || (offlineVideo !== null && !isOfflineJobFailed)" class="recorded-program__menu">
+            <div v-if="!forOffline || offlineVideo !== null" class="recorded-program__menu">
                 <v-menu location="bottom end" :close-on-content-click="true">
                     <template v-slot:activator="{ props }">
                         <div v-ripple class="recorded-program__menu-button"
@@ -194,9 +194,9 @@
                 <Icon icon="fluent:delete-20-regular" width="20px" height="20px" />
             </v-btn>
         </div>
-        <div v-if="offlineDownloadProgress !== null" class="recorded-program__offline-progress">
+        <div v-if="displayedOfflineDownloadProgress !== null" class="recorded-program__offline-progress">
             <div class="recorded-program__offline-progress-bar"
-                :style="`width: ${offlineDownloadProgress}%`">
+                :style="`width: ${displayedOfflineDownloadProgress}%`">
             </div>
         </div>
     </component>
@@ -520,6 +520,22 @@ const offlineDownloadProgress = computed(() => {
     if (props.offlineDownloadJob.estimated_size_bytes <= 0) return 0;
     return Math.min(99, (props.offlineDownloadJob.downloaded_bytes / props.offlineDownloadJob.estimated_size_bytes) * 100);
 });
+
+// Background Fetch は受信完了後の展開中も進捗を維持し、通常 Fetch は再接続時の確定位置を表示する
+const displayedOfflineDownloadProgress = ref<number | null>(null);
+watch(
+    () => [props.offlineDownloadJob?.job_id, offlineDownloadProgress.value] as const,
+    ([jobID, progress], previous) => {
+        const job = props.offlineDownloadJob;
+        if (job !== null && job.background_fetch_id !== null && jobID === previous?.[0] && progress !== null) {
+            displayedOfflineDownloadProgress.value = Math.max(displayedOfflineDownloadProgress.value ?? 0, progress);
+        } else {
+            // 新しいジョブと終了済みのジョブでは、前の表示値を初期化する
+            displayedOfflineDownloadProgress.value = progress;
+        }
+    },
+    { immediate: true },
+);
 
 // 実行中の保存ジョブをキャンセルする
 const cancelOfflineDownload = () => {
@@ -1210,13 +1226,6 @@ const deleteVideo = async () => {
     }
 
     &--offline {
-        .recorded-program__content-meta-time {
-            max-width: 100%;
-            overflow: hidden;
-            white-space: nowrap;
-            text-overflow: ellipsis;
-        }
-
         .recorded-program__content-header {
             @include smartphone-vertical {
                 // 右上の画質/容量チップはカード全体ではなく、本文列の右端へそろえる
@@ -1267,6 +1276,7 @@ const deleteVideo = async () => {
         contain-intrinsic-height: auto 165px;
 
         .recorded-program__container {
+            position: relative;
             height: auto;
             min-height: 112px;
         }
@@ -1282,7 +1292,21 @@ const deleteVideo = async () => {
         }
 
         .recorded-program__content {
+            margin-right: 36px;
+        }
+
+        @include smartphone-vertical {
+            .recorded-program__content-meta-time {
+                height: auto;
+            }
+        }
+
+        &.recorded-program--offline-blocked .recorded-program__content {
             margin-right: 0;
+        }
+
+        .recorded-program__menu {
+            right: 0;
         }
 
         &:hover {

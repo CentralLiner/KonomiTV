@@ -42,8 +42,6 @@ interface IOfflineVideoStreamMetadata {
 interface IOfflineVideoSessionInfo extends IOfflineVideoStreamMetadata {
     protocol_version: 2;
     generation_token: string;
-    lease_timeout_seconds: number;
-    max_segment_bytes: number;
 }
 
 interface IOfflineVideoConnection {
@@ -363,12 +361,16 @@ export default class OfflineVideos {
                 if (isRegistered) {
                     const wasCancelled = controller.signal.aborted;
                     controller.abort();
+                    // 準備処理の終了後に状態を確定し、未完成データを一度だけ回収する。
                     if (wasCancelled) {
-                        await this.markJobCancelled(jobID);
+                        await OfflineVideoStorage.transitionActiveJobToTerminalState(jobID, 'Cancelled', null);
                     } else {
-                        await this.markJobFailed(jobID, error instanceof Error ? error.message : 'オフライン保存を開始できませんでした。');
+                        await OfflineVideoStorage.transitionActiveJobToTerminalState(
+                            jobID, 'Failed', error instanceof Error ? error.message : 'オフライン保存を開始できませんでした。',
+                        );
                     }
                     await this.deleteIncompleteGeneration(job);
+                    this.notifyChange();
                 }
                 throw error;
             } finally {
@@ -416,12 +418,24 @@ export default class OfflineVideos {
         }
         await this.updateJob(job);
 
-        // 実況は保存開始と並行で処理し、先にジョブが終了した場合は遅れて保存されたデータも回収する。
+        // 実況は時間がかかるため、保存開始と並行で受信する。
         void (async () => {
             const destination = `${baseURL}/assets/jikkyo.json`;
-            await this.cacheOptionalAsset(cache, `${Utils.api_base_url}/videos/${job.video_id}/jikkyo`, destination, signal);
+            const response = await fetch(new Request(`${Utils.api_base_url}/videos/${job.video_id}/jikkyo`, {signal}));
+            if (!response.ok) return;
+
+            // 受信を待つ間に終了した保存の状態を確認する。
             const latestJob = await OfflineVideoStorage.getJob(job.job_id);
-            if (latestJob === null || latestJob.state === 'Failed' || latestJob.state === 'Cancelled') {
+            if (latestJob === null || latestJob.generation_id !== job.generation_id ||
+                ['Failed', 'Cancelled'].includes(latestJob.state)) {
+                return;
+            }
+            await cache.put(destination, response);
+
+            // 書き込み中に終了した場合は、遅れて保存された実況データも回収する。
+            const jobAfterWrite = await OfflineVideoStorage.getJob(job.job_id);
+            if (jobAfterWrite === null || jobAfterWrite.generation_id !== job.generation_id ||
+                ['Failed', 'Cancelled'].includes(jobAfterWrite.state)) {
                 await cache.delete(destination);
             }
         })().catch((error: unknown) => {
@@ -430,56 +444,31 @@ export default class OfflineVideos {
     }
 
     private static async cacheOptionalAsset(cache: Cache, source: string, destination: string, signal: AbortSignal): Promise<void> {
+        const request = new Request(source);
         const {controller, dispose} = this.linkAbortController(signal);
-        const timeout = setTimeout(() => controller.abort(), 30_000);
-        let reader: ReadableStreamDefaultReader<Uint8Array> | undefined;
-        let bodyReadFailed = false;
         try {
-            const response = await this.fetchResponse(source, {signal: controller.signal});
+            const response = await fetch(request, {signal: controller.signal});
             if (!response.ok) {
                 console.warn('[OfflineVideos] Optional offline asset returned HTTP', response.status);
                 return;
             }
-            reader = response.body?.getReader();
-            const bodyReader = reader;
-            const body = bodyReader === undefined ? null : new ReadableStream<Uint8Array>({
-                async pull(stream) {
-                    let result: ReadableStreamReadResult<Uint8Array>;
-                    try {
-                        result = await bodyReader.read();
-                    } catch (error) {
-                        bodyReadFailed = true;
-                        stream.error(error);
-                        return;
-                    }
-                    if (result.done) {
-                        stream.close();
-                    } else {
-                        stream.enqueue(result.value);
-                    }
-                },
-                cancel: () => bodyReader.cancel(),
-            });
-            await cache.put(destination, new Response(body, {
-                status: response.status,
-                statusText: response.statusText,
-                headers: response.headers,
-            }));
+            // cache.put() が本文を読み切るまで、ジョブのキャンセルを Fetch に伝える。
+            try {
+                await cache.put(destination, response);
+            } catch (error) {
+                signal.throwIfAborted();
+                console.warn('[OfflineVideos] Failed to cache an optional offline asset:', error);
+            }
         } catch (error) {
             signal.throwIfAborted();
-            if (error instanceof OfflineDownloadNetworkError || bodyReadFailed) {
+            if (error instanceof TypeError || (error instanceof DOMException && error.name === 'NetworkError')) {
                 console.warn('[OfflineVideos] Failed to download an optional offline asset:', error);
                 return;
             }
             throw error;
         } finally {
-            clearTimeout(timeout);
             controller.abort();
             dispose();
-            if (reader !== undefined) {
-                await reader.cancel().catch(() => {});
-                reader.releaseLock();
-            }
         }
     }
 
@@ -585,13 +574,17 @@ export default class OfflineVideos {
         } catch (error) {
             try {
                 if (signal.aborted) {
-                    await this.markJobCancelled(job.job_id);
+                    await OfflineVideoStorage.transitionActiveJobToTerminalState(job.job_id, 'Cancelled', null);
                 } else {
                     console.error('[OfflineVideos] Foreground offline download failed:', error);
-                    await this.markJobFailed(job.job_id, error instanceof Error ? error.message : 'オフライン保存に失敗しました。');
+                    await OfflineVideoStorage.transitionActiveJobToTerminalState(
+                        job.job_id, 'Failed', error instanceof Error ? error.message : 'オフライン保存に失敗しました。',
+                    );
                 }
             } finally {
+                // 書き込みが決着してから回収し、キャンセル後に保存された断片も削除する。
                 await this.deleteIncompleteGeneration(job);
+                this.notifyChange();
             }
         } finally {
             this.setReconnecting(job.job_id, false);
@@ -736,7 +729,7 @@ export default class OfflineVideos {
     }
 
     private static async fetchResponse(url: string, options: RequestInit): Promise<Response> {
-        const request = new Request(url, {...options, cache: 'no-store', redirect: 'error'});
+        const request = new Request(url, {...options, redirect: 'error'});
         try {
             return await fetch(request);
         } catch (error) {
@@ -799,11 +792,7 @@ export default class OfflineVideos {
         if (typeof info !== 'object' || info === null) return false;
         const data = info as Partial<IOfflineVideoSessionInfo>;
         return data.protocol_version === 2 &&
-            typeof data.generation_token === 'string' && /^[0-9a-f]{32}$/.test(data.generation_token) &&
-            typeof data.lease_timeout_seconds === 'number' && data.lease_timeout_seconds > 0 &&
-            Number.isFinite(data.lease_timeout_seconds) &&
-            typeof data.max_segment_bytes === 'number' && Number.isInteger(data.max_segment_bytes) &&
-            data.max_segment_bytes > 0 && data.max_segment_bytes <= this.MAX_SEGMENT_BYTES;
+            typeof data.generation_token === 'string' && /^[0-9a-f]{32}$/.test(data.generation_token);
     }
 
     private static matchesJob(metadata: IOfflineVideoStreamMetadata, job: IOfflineDownloadJob): boolean {
@@ -892,8 +881,16 @@ export default class OfflineVideos {
             const metadata = await this.receiveSegments(job, response, cache, progress);
             await this.completeDownload(job, cache, metadata, progress);
         } catch (error) {
-            // Service Worker が最終状態を確定する。キャンセル後に書き込まれた断片も回収する。
-            await this.deleteIncompleteGeneration(job);
+            // 実行中のジョブは Service Worker が失敗を確定して回収する。
+            // 先にキャンセルや失敗が確定していた場合は、その後に書き込まれた断片をここで回収する。
+            try {
+                const latestJob = await OfflineVideoStorage.getJob(jobID);
+                if (latestJob === null || latestJob.state === 'Cancelled' || latestJob.state === 'Failed') {
+                    await this.deleteIncompleteGeneration(job);
+                }
+            } catch (cleanupError) {
+                console.warn('[OfflineVideos] Failed to clean up the offline video download:', cleanupError);
+            }
             throw error;
         }
     }
@@ -980,11 +977,10 @@ export default class OfflineVideos {
                 const {info} = connection;
                 if (metadata.session_id !== connection.sessionID || metadata.next_sequence !== progress.segmentDurations.length ||
                     !this.isSessionInfo(metadata) || metadata.generation_token !== info.generation_token ||
-                    metadata.duration_seconds !== info.duration_seconds || metadata.lease_timeout_seconds !== info.lease_timeout_seconds ||
-                    metadata.max_segment_bytes !== info.max_segment_bytes) {
+                    metadata.duration_seconds !== info.duration_seconds) {
                     throw new Error('オフライン保存の配信応答が開始時の情報と一致しません。');
                 }
-                maxSegmentBytes = info.max_segment_bytes;
+                maxSegmentBytes = this.MAX_SEGMENT_BYTES;
                 this.setReconnecting(job.job_id, false);
             }
 
@@ -1014,8 +1010,10 @@ export default class OfflineVideos {
                 await cache.put(`${baseURL}/segments/${sequence}.ts`, new Response(segmentData, {
                     headers: {'Content-Type': 'video/mp2t'},
                 }));
-                // CacheStorage とジョブ状態の確定を待ってから、次に要求する番号を進める。
-                await this.updateJob(job);
+                // 通常 Fetch ではジョブ状態の確定を待ってから、次に要求する番号を進める。
+                if (connection !== undefined) {
+                    await this.updateJob(job);
+                }
                 progress.segmentDurations.push(value / 1000);
                 progress.sizeBytes += segmentLength;
             }
@@ -1404,6 +1402,7 @@ export default class OfflineVideos {
     private static async acquireForegroundActivityProtection(signal: AbortSignal): Promise<(() => void) | null> {
 
         if ('RTCPeerConnection' in window === false) return null;
+        signal.throwIfAborted();
 
         const offerPeerConnection = new RTCPeerConnection({iceServers: []});
         const answerPeerConnection = new RTCPeerConnection({iceServers: []});
@@ -1414,48 +1413,43 @@ export default class OfflineVideos {
             offerPeerConnection.close();
             answerPeerConnection.close();
         };
-        signal.addEventListener('abort', closeConnections, {once: true});
 
-        /** ICE 候補を SDP に集約し、外部の STUN サーバーなしでローカル接続を確立できるまで待つ */
-        const waitForICEGathering = async (peerConnection: RTCPeerConnection): Promise<void> => {
-            if (peerConnection.iceGatheringState === 'complete') return;
-            await new Promise<void>((resolve, reject) => {
-                const finish = (error?: unknown) => {
-                    window.clearTimeout(timeoutID);
-                    peerConnection.removeEventListener('icegatheringstatechange', onICEGatheringStateChange);
-                    signal.removeEventListener('abort', onAbort);
-                    if (error === undefined) resolve();
-                    else reject(error);
+        const {controller, dispose} = this.linkAbortController(signal);
+        const preparationSignal = controller.signal;
+        // Offer や Answer の生成も含めて、準備全体の待機時間を制限する。
+        const timeoutID = setTimeout(() => {
+            controller.abort(new Error('WebRTC のローカル接続準備がタイムアウトしました。'));
+        }, 15_000);
+
+        const waitUntilReady = async (target: EventTarget, event: string, isReady: () => boolean): Promise<void> => {
+            preparationSignal.throwIfAborted();
+            if (isReady()) return;
+            await new Promise<void>(resolve => {
+                const onReady = () => {
+                    if (isReady()) {
+                        target.removeEventListener(event, onReady);
+                        resolve();
+                    }
                 };
-                const timeoutID = window.setTimeout(() => finish(new Error('WebRTC のローカル接続準備がタイムアウトしました。')), 5_000);
-                const onAbort = () => finish(signal.reason);
-                const onICEGatheringStateChange = (): void => {
-                    if (peerConnection.iceGatheringState === 'complete') finish();
-                };
-                if (signal.aborted) {
-                    onAbort();
-                    return;
-                }
-                signal.addEventListener('abort', onAbort, {once: true});
-                peerConnection.addEventListener('icegatheringstatechange', onICEGatheringStateChange);
+                target.addEventListener(event, onReady, {signal: preparationSignal});
             });
         };
 
-        try {
+        const connect = async (): Promise<void> => {
             answerPeerConnection.addEventListener('datachannel', (event) => {
                 dataChannels.push(event.channel);
-            }, {once: true});
+            }, {once: true, signal: preparationSignal});
 
             // ICE 候補を含む Offer / Answer を同一ページ内で交換し、ネットワーク上の相手を必要としない接続にする
             await offerPeerConnection.setLocalDescription(await offerPeerConnection.createOffer());
-            await waitForICEGathering(offerPeerConnection);
+            await waitUntilReady(offerPeerConnection, 'icegatheringstatechange', () => offerPeerConnection.iceGatheringState === 'complete');
             const offerDescription = offerPeerConnection.localDescription;
             if (offerDescription === null) {
                 throw new Error('WebRTC の Offer を作成できませんでした。');
             }
             await answerPeerConnection.setRemoteDescription(offerDescription);
             await answerPeerConnection.setLocalDescription(await answerPeerConnection.createAnswer());
-            await waitForICEGathering(answerPeerConnection);
+            await waitUntilReady(answerPeerConnection, 'icegatheringstatechange', () => answerPeerConnection.iceGatheringState === 'complete');
             const answerDescription = answerPeerConnection.localDescription;
             if (answerDescription === null) {
                 throw new Error('WebRTC の Answer を作成できませんでした。');
@@ -1463,33 +1457,25 @@ export default class OfflineVideos {
             await offerPeerConnection.setRemoteDescription(answerDescription);
 
             // Chrome が保護対象と判定するのは開いた DataChannel なので、接続完了後に動画転送へ進む
-            if (offerDataChannel.readyState !== 'open') {
-                await new Promise<void>((resolve, reject) => {
-                    const finish = (error?: unknown) => {
-                        window.clearTimeout(timeoutID);
-                        offerDataChannel.removeEventListener('open', onOpen);
-                        signal.removeEventListener('abort', onAbort);
-                        if (error === undefined) resolve();
-                        else reject(error);
-                    };
-                    const timeoutID = window.setTimeout(() => finish(new Error('WebRTC のローカル接続がタイムアウトしました。')), 5_000);
-                    const onAbort = () => finish(signal.reason);
-                    const onOpen = () => finish();
-                    if (signal.aborted) {
-                        onAbort();
-                        return;
-                    }
-                    signal.addEventListener('abort', onAbort, {once: true});
-                    offerDataChannel.addEventListener('open', onOpen, {once: true});
-                });
-            }
+            await waitUntilReady(offerDataChannel, 'open', () => offerDataChannel.readyState === 'open');
+        };
 
+        try {
+            preparationSignal.throwIfAborted();
+            // close() 後に Offer / Answer の Promise が未解決でも、保存処理の待機を終了する。
+            const interrupted = new Promise<never>((_, reject) => {
+                preparationSignal.addEventListener('abort', () => reject(preparationSignal.reason), {once: true});
+            });
+            await Promise.race([connect(), interrupted]);
+            preparationSignal.throwIfAborted();
             return closeConnections;
         } catch (error) {
             closeConnections();
             throw error;
         } finally {
-            signal.removeEventListener('abort', closeConnections);
+            clearTimeout(timeoutID);
+            dispose();
+            controller.abort();
         }
     }
 
