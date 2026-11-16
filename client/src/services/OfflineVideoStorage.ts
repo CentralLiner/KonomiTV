@@ -202,12 +202,7 @@ export default class OfflineVideoStorage {
     /** 指定した失敗ジョブを一覧から削除する */
     static async deleteJob(jobID: string): Promise<void> {
         const database = await this.openDatabase();
-        const transaction = database.transaction(this.JOB_STORE_NAME, 'readwrite');
-        const job = await transaction.store.get(jobID);
-        if (job?.state === 'Failed') {
-            await transaction.store.delete(jobID);
-        }
-        await transaction.done;
+        await database.delete(this.JOB_STORE_NAME, jobID);
         this.eventTarget.dispatchEvent(new Event('change'));
     }
 

@@ -147,23 +147,38 @@ function downloadFixture({interruptFirstResponse = false, failStorage = null, re
     };
 }
 
-for (const failure of ['HTTP', 'HTTP エラー後の本文切断', 'CacheStorage']) {
+for (const failure of ['HTTP', 'HTTP エラー後の本文切断', '本文の途中切断', 'CacheStorage']) {
     test(`付随画像に失敗してもジョブを継続する (${failure})`, async () => {
-        const bodyDisconnected = failure === 'HTTP エラー後の本文切断';
+        const bodyDisconnected = failure.includes('本文');
+        const status = failure === 'CacheStorage' || failure === '本文の途中切断' ? 200 : 503;
         let bodyCancelled = false;
         const fixture = downloadFixture({respond: async () => new Response(new ReadableStream({
             start(controller) {
                 if (bodyDisconnected) controller.error(new TypeError('Connection lost after receiving the image headers.'));
             },
             cancel() { bodyCancelled = true; },
-        }), {status: failure === 'CacheStorage' ? 200 : 503})});
+        }), {status})});
         const controller = new AbortController();
-        const cache = {put: async () => { throw new DOMException('CacheStorage is full', 'QuotaExceededError'); }};
+        const cache = {put: async (_url, response) => {
+            if (failure === 'CacheStorage') throw new DOMException('CacheStorage is full', 'QuotaExceededError');
+            await response.arrayBuffer();
+        }};
         await fixture.service.cacheOptionalAsset(cache, 'https://konomitv.test/image', '/image', controller.signal);
         assert.equal(bodyCancelled, !bodyDisconnected);
         assert.equal(controller.signal.aborted, false);
     });
 }
+
+test('付随画像の保存中に実装上の例外が発生したらジョブを失敗にする', async () => {
+    const fixture = downloadFixture({beforeWrite(url) {
+        if (url.endsWith('/thumbnail.webp')) throw new ReferenceError('Injected implementation error');
+    }});
+    fixture.job.state = 'Cancelled';
+    await assert.rejects(fixture.service.start(fixture.job.program, '240p'), ReferenceError);
+    assert.equal(fixture.job.state, 'Failed');
+    assert.equal(fixture.video, fixture.previousVideo);
+    assert.equal(fixture.requests.some(request => request.url.includes('/offline-sessions/')), false);
+});
 
 for (const useBackgroundFetch of [false, true]) {
     const mode = useBackgroundFetch ? 'Background Fetch' : '通常 Fetch';
@@ -395,24 +410,38 @@ test('サムネイルの書き込みに失敗しても Background Fetch を開�
     assert.ok(fixture.writes.every(url => !url.endsWith('/thumbnail.webp')));
 });
 
-for (const shouldCancel of [true, false]) {
-    const scenario = shouldCancel
-        ? 'WebRTC の Offer が未解決でもキャンセルでロックを解放する'
-        : 'WebRTC の最初の ICE 収集が終わらなければ5秒で動画本体の保存へ進む';
+for (const [phase, scenario] of [
+    ['Cancel', 'WebRTC の Offer が未解決でもキャンセルでロックを解放する'],
+    ['Offer', 'WebRTC の Offer が未解決でも5秒後に動画保存を開始する'],
+    ['ICE', 'ICE 候補の収集が止まっても5秒後に動画保存を開始する'],
+    ['DataChannel', 'WebRTC の準備を段階ごとに5秒待つ'],
+]) {
+    const shouldCancel = phase === 'Cancel';
     test(scenario, {timeout: 5000}, async (t) => {
         t.mock.timers.enable({apis: ['setTimeout']});
         const offerStarted = Promise.withResolvers();
         const closePeer = t.mock.fn();
+        const peers = [];
+        const dataChannel = Object.assign(new EventTarget(), {readyState: 'connecting', close() {}});
         class PeerConnection extends EventTarget {
             iceGatheringState = 'gathering';
-            createDataChannel() { return {close() {}}; }
+            localDescription = null;
+            constructor() {
+                super();
+                peers.push(this);
+            }
+            createDataChannel() { return dataChannel; }
             close() { closePeer(); }
             createOffer() {
                 offerStarted.resolve();
                 // ブラウザは接続を閉じると作成中の Offer を確定しない場合がある。
-                return shouldCancel ? new Promise(() => {}) : Promise.resolve({});
+                return shouldCancel || phase === 'Offer' ? new Promise(() => {}) : Promise.resolve({});
             }
-            async setLocalDescription() {}
+            async createAnswer() { return {}; }
+            async setLocalDescription(description) {
+                this.localDescription = description;
+            }
+            async setRemoteDescription() {}
         }
 
         const fixture = downloadFixture({peerConnection: PeerConnection});
@@ -427,8 +456,19 @@ for (const shouldCancel of [true, false]) {
             await fixture.service.cancel(job.job_id);
         } else {
             await setImmediate();
+            if (phase === 'DataChannel') {
+                // Offer と Answer がそれぞれ期限直前に準備できても、DataChannel に次の5秒を使う。
+                for (const peer of peers) {
+                    t.mock.timers.tick(4999);
+                    assert.equal(closePeer.mock.callCount(), 0);
+                    peer.iceGatheringState = 'complete';
+                    peer.dispatchEvent(new Event('icegatheringstatechange'));
+                    await setImmediate();
+                }
+            }
             t.mock.timers.tick(4999);
             assert.equal(closePeer.mock.callCount(), 0);
+            assert.equal(fixture.requests.some(request => request.url.includes('/offline-sessions/')), false);
             t.mock.timers.tick(1);
         }
         await foregroundDownload.mock.calls[0].result;

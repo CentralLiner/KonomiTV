@@ -75,6 +75,7 @@ const isLoading = ref(true);
 const reconnectingJobIDs = ref(new Set<string>());
 const retryingJobIDs = ref(new Set<string>());
 let isRefreshing = false;
+let isRefreshingActiveProgress = false;
 let needsRefresh = false;
 
 const activeJobs = computed(() => jobs.value.filter(job => ['Waiting', 'Downloading', 'Finalizing'].includes(job.state)));
@@ -126,7 +127,9 @@ const applyBackgroundFetchProgress = async (targetJobs: IOfflineDownloadJob[]): 
 
 /** 実行中ジョブの進捗を IndexedDB と Background Fetch から既存配列へ反映する */
 const refreshActiveJobProgress = async (): Promise<void> => {
-    if (activeJobs.value.length === 0) return;
+    if (isRefreshing || isRefreshingActiveProgress || activeJobs.value.length === 0) return;
+    isRefreshingActiveProgress = true;
+    const currentJobs = jobs.value;
     try {
         const latestJobs = await OfflineVideos.getJobs();
         let needsFullRefresh = false;
@@ -162,6 +165,9 @@ const refreshActiveJobProgress = async (): Promise<void> => {
                 nextState = nextDownloadedBytes > 0 ? 'Downloading' : 'Waiting';
             }
 
+            // 一覧の全体更新が始まった場合は、その更新で読み直した値を使う。
+            if (isRefreshing || jobs.value !== currentJobs) return;
+
             // 関連する表示値を同じ同期処理内で代入し、状態ラベルとプログレスバーの中間表示を防ぐ
             job.downloaded_bytes = nextDownloadedBytes;
             job.state = nextState;
@@ -173,6 +179,8 @@ const refreshActiveJobProgress = async (): Promise<void> => {
         }
     } catch (error) {
         console.error('[OfflineVideos] Failed to refresh active offline job progress:', error);
+    } finally {
+        isRefreshingActiveProgress = false;
     }
 };
 

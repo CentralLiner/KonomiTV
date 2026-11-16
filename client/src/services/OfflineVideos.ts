@@ -456,30 +456,41 @@ export default class OfflineVideos {
     }
 
     private static async cacheOptionalAsset(cache: Cache, source: string, destination: string, signal: AbortSignal): Promise<void> {
-        let response: Response | undefined;
+        const request = new Request(source, {signal});
+        const response = await fetch(request).catch((error: unknown) => {
+            signal.throwIfAborted();
+            if (error instanceof TypeError || (error instanceof DOMException && error.name === 'NetworkError')) {
+                console.warn('[OfflineVideos] Failed to download an optional offline asset:', error);
+                return null;
+            }
+            throw error;
+        });
+        if (response === null) return;
+
         try {
-            response = await fetch(source, {signal});
-            if (!response.ok) {
-                console.warn('[OfflineVideos] Optional offline asset returned HTTP', response.status);
+            // エラーレスポンスと CacheStorage に保存できない HTTP レスポンスは、画像の取得失敗として扱う。
+            const vary = response.headers.get('Vary');
+            if (!response.ok || response.status === 206 || vary?.split(',').some(value => value.trim() === '*')) {
+                console.warn('[OfflineVideos] Optional offline asset returned an uncacheable response.', response.status);
                 return;
             }
+
             // cache.put() が本文を読み切るまで、ジョブのキャンセルを Fetch に伝える。
+            const hasUnreadBody = !response.bodyUsed && response.body?.locked !== true;
             try {
                 await cache.put(destination, response);
             } catch (error) {
                 signal.throwIfAborted();
+                const isStorageError = error instanceof DOMException &&
+                    ['QuotaExceededError', 'NetworkError', 'UnknownError', 'AbortError'].includes(error.name);
+                // 未使用の本文を読み始めた後の TypeError は、本文の通信・デコード失敗として扱う。
+                const isBodyReadError = error instanceof TypeError && hasUnreadBody && response.bodyUsed;
+                if (!isStorageError && !isBodyReadError) throw error;
                 console.warn('[OfflineVideos] Failed to cache an optional offline asset:', error);
             }
-        } catch (error) {
-            signal.throwIfAborted();
-            if (error instanceof TypeError || (error instanceof DOMException && error.name === 'NetworkError')) {
-                console.warn('[OfflineVideos] Failed to download an optional offline asset:', error);
-                return;
-            }
-            throw error;
         } finally {
             // HTTP エラーや書き込み開始前の失敗では、未読の本文のダウンロードを残さない。
-            if (response !== undefined && !response.bodyUsed && !signal.aborted) {
+            if (!response.bodyUsed && !response.body?.locked && !signal.aborted) {
                 await response.body?.cancel().catch((error: unknown) => {
                     signal.throwIfAborted();
                     console.warn('[OfflineVideos] Failed to cancel an optional offline asset response body:', error);
@@ -1436,16 +1447,21 @@ export default class OfflineVideos {
 
         const {controller, dispose} = this.linkAbortController(signal);
         const preparationSignal = controller.signal;
-        let readinessTimeout: ReturnType<typeof setTimeout> | undefined;
+        let preparationTimeout: ReturnType<typeof setTimeout> | undefined;
+
+        const startPreparationStage = (): void => {
+            preparationSignal.throwIfAborted();
+            clearTimeout(preparationTimeout);
+            // Offer、Answer、DataChannel の準備には段階ごとに5秒の猶予を設ける。
+            preparationTimeout = setTimeout(() => {
+                controller.abort(new Error('WebRTC のローカル接続準備がタイムアウトしました。'));
+            }, 5000);
+        };
 
         const waitUntilReady = async (target: EventTarget, event: string, isReady: () => boolean): Promise<void> => {
             preparationSignal.throwIfAborted();
             if (isReady()) return;
             await new Promise<void>(resolve => {
-                // ICE 候補の収集と DataChannel の確立は、それぞれ最大5秒待つ。
-                readinessTimeout = setTimeout(() => {
-                    controller.abort(new Error('WebRTC のローカル接続準備がタイムアウトしました。'));
-                }, 5000);
                 const onReady = () => {
                     if (isReady()) {
                         target.removeEventListener(event, onReady);
@@ -1454,7 +1470,6 @@ export default class OfflineVideos {
                 };
                 target.addEventListener(event, onReady, {signal: preparationSignal});
             });
-            clearTimeout(readinessTimeout);
         };
 
         const connect = async (): Promise<void> => {
@@ -1463,12 +1478,14 @@ export default class OfflineVideos {
             }, {once: true, signal: preparationSignal});
 
             // ICE 候補を含む Offer / Answer を同一ページ内で交換し、ネットワーク上の相手を必要としない接続にする
+            startPreparationStage();
             await offerPeerConnection.setLocalDescription(await offerPeerConnection.createOffer());
             await waitUntilReady(offerPeerConnection, 'icegatheringstatechange', () => offerPeerConnection.iceGatheringState === 'complete');
             const offerDescription = offerPeerConnection.localDescription;
             if (offerDescription === null) {
                 throw new Error('WebRTC の Offer を作成できませんでした。');
             }
+            startPreparationStage();
             await answerPeerConnection.setRemoteDescription(offerDescription);
             await answerPeerConnection.setLocalDescription(await answerPeerConnection.createAnswer());
             await waitUntilReady(answerPeerConnection, 'icegatheringstatechange', () => answerPeerConnection.iceGatheringState === 'complete');
@@ -1476,6 +1493,7 @@ export default class OfflineVideos {
             if (answerDescription === null) {
                 throw new Error('WebRTC の Answer を作成できませんでした。');
             }
+            startPreparationStage();
             await offerPeerConnection.setRemoteDescription(answerDescription);
 
             // Chrome が保護対象と判定するのは開いた DataChannel なので、接続完了後に動画転送へ進む
@@ -1495,7 +1513,7 @@ export default class OfflineVideos {
             closeConnections();
             throw error;
         } finally {
-            clearTimeout(readinessTimeout);
+            clearTimeout(preparationTimeout);
             dispose();
             controller.abort();
         }
