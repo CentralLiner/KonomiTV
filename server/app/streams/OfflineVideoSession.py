@@ -12,7 +12,7 @@ from typing import ClassVar
 
 from anyio import CancelScope, move_on_after
 from fastapi import HTTPException
-from fastapi.responses import JSONResponse, StreamingResponse
+from fastapi.responses import StreamingResponse
 from starlette.requests import ClientDisconnect
 from starlette.types import Message, Receive, Scope, Send
 
@@ -20,11 +20,17 @@ from app import logging
 from app.metadata.MetadataAnalyzer import MetadataAnalyzer
 from app.models.RecordedProgram import RecordedProgram
 from app.models.RecordedVideo import RecordedVideo
-from app.schemas import OfflineVideoSessionInfo, OfflineVideoSessionStreamMetadata
+from app.schemas import (
+    OfflineVideoSessionErrorDetail,
+    OfflineVideoSessionInfo,
+    OfflineVideoSessionStreamMetadata,
+)
 from app.streams.StreamEncodingOptions import StreamQualityWithOptions
 from app.streams.VideoStream import VideoStream
 
 
+# オフライン保存はエンコーダーを長時間占有するため、通常視聴分の余裕を残して同時実行数を制限する
+# 通常 Fetch と Background Fetch のエンコードは同じ実行枠を使う
 OFFLINE_VIDEO_STREAM_SEMAPHORE = asyncio.Semaphore(3)
 
 
@@ -42,7 +48,7 @@ def OfflineVideoSessionError(status_code: int, code: str, retry_after: int | Non
     """
     return HTTPException(
         status_code,
-        detail = {'code': code},
+        detail = OfflineVideoSessionErrorDetail(code=code),
         headers = {'Retry-After': str(retry_after)} if retry_after is not None else None,
     )
 
@@ -74,14 +80,21 @@ class OfflineVideoSession:
             recorded_program (RecordedProgram): 作成時点の録画情報
             quality (str): 追加オプションを含む要求画質
             stream_quality (StreamQualityWithOptions): エンコーダーへ渡す画質
+
+        Returns:
+            None
         """
+        # create() が登録に使い、_cleanup() が回収時に取り除く保存 ID
         self.session_id = session_id
+        # _matchesRecording() の照合基準となる作成時の録画情報。_encode() が同じ録画を入力に使う
         self._recorded_program = recorded_program
+        # _encode() が使用する検証済みの画質と追加オプション
         self._stream_quality = stream_quality
-        # 実ファイルの照合は最初の GET で行い、以後の接続と正常終端で比較する。
+        # _matchesRecording() が最初の GET で記録し、以後の接続と正常終端で比較するファイルの識別情報
         self._file_identity: tuple[int, int, int, int, int] | None = None
-        # connect() で並行 GET の照合を共有し、close() で待機中の GET を終了させる。
+        # connect() が並行 GET で共有する録画照合タスク。close() が待機中の照合を中断する
         self._connection_recording_check: asyncio.Task[bool | None] | None = None
+        # create() の応答と stream() の先頭に載せる録画情報・画質・世代トークン
         self.info = OfflineVideoSessionInfo(
             video_id = recorded_program.id,
             file_hash = recorded_program.recorded_video.file_hash,
@@ -90,23 +103,36 @@ class OfflineVideoSession:
             generation_token = secrets.token_hex(16),
         )
 
-        # 確定した TS と再生時間を再送にも使う。送信中は ACK 後も参照数を数える。
+        # publishSegment() が確定した TS と再生時間。stream() は再送時も同じ本体を参照する
         self._retained: dict[int, tuple[bytes, float]] = {}
+        # stream() が保持する送信中の参照数。_acknowledge() はこの参照の解放を待ってデータを破棄する
         self._sending: dict[int, int] = {}
+        # waitForCapacity() が確認する確定データの総容量。ACK 後も送信中の本体を含む
         self._retained_bytes = 0
+        # _acknowledge() が確定した連続範囲の次の番号。connect() が再開位置の下限に使う
         self._acked_next = 0
+        # stream() が送信処理へ渡した連続範囲の次の番号。_acknowledge() が確定位置の上限に使う
         self._offered_next = 0
+        # publishSegment() が確定した連続範囲の次の番号。stream() が正常終端で件数として返す
         self._produced_next = 0
+        # stream() と waitForCapacity() が、生成・容量解放・変換終了を待つための通知
         self._changed = asyncio.Event()
+        # _encode() が正常に終了したことを stream() に伝えるフラグ
         self._is_complete = False
 
-        # 接続番号は切断後も保持し、遅れて届いた GET が接続を奪うことを防ぐ。
+        # connect() が受理した最新の接続番号。_validateConnection() の検証に使うため切断後も保持する
         self._connection_id = 0
+        # bindResponse() が登録した現応答の中断先。connect() の引き継ぎと close() で使う
         self._response_scope: CancelScope | None = None
+        # _encode() が実行枠を取得した後に作成する変換用ストリーム。_cleanup() が破棄する
         self._stream: VideoStream | None = None
+        # bindResponse() が初回接続で起動する変換タスク。_cleanup() が終了を待つ
         self._encoding_task: asyncio.Task[None] | None = None
+        # close() が一度だけ起動する回収タスク。is_closed はこのタスクの有無で回収開始を判定する
         self._close_task: asyncio.Task[None] | None = None
+        # _renewLease() が設定する単調時計上の期限。is_closed はタイマー発火前もこの値を確認する
         self._lease_deadline = 0.0
+        # _renewLease() が設定する期限切れタイマー。close() が回収開始時に解除する
         self._lease_timer: asyncio.TimerHandle | None = None
         self._renewLease()
 
@@ -185,6 +211,9 @@ class OfflineVideoSession:
         """
         有効期限を確認し、期限切れなら回収を開始する。
 
+        Args:
+            なし
+
         Returns:
             bool: セッションの回収が始まっていれば True
         """
@@ -197,6 +226,9 @@ class OfflineVideoSession:
         """
         サーバー終了時に全セッションの回収を待つ。
 
+        Args:
+            なし
+
         Returns:
             None
         """
@@ -205,6 +237,9 @@ class OfflineVideoSession:
     def close(self) -> asyncio.Task[None]:
         """
         接続を中断し、セッションの回収を一度だけ開始する。
+
+        Args:
+            なし
 
         Returns:
             asyncio.Task[None]: 資源の回収を待つためのタスク
@@ -295,6 +330,15 @@ class OfflineVideoSession:
             raise
 
         def ReleaseFileIOSlot(done: asyncio.Future[T]) -> None:
+            """
+            ワーカーの終了後に実行枠と Future の例外を回収する。
+
+            Args:
+                done (asyncio.Future[T]): 終了した録画 I/O の Future
+
+            Returns:
+                None
+            """
             slots.release()
             # 呼び出し元が離脱した場合も、完了した Future の例外を回収する。
             if not done.cancelled():
@@ -464,10 +508,30 @@ class OfflineVideoSession:
             self._response_scope = None
 
     def _validateTarget(self, video_id: int, quality: str) -> None:
+        """
+        要求した録画と画質が、登録されたセッションと一致することを確認する。
+
+        Args:
+            video_id (int): 要求された録画番組の ID
+            quality (str): 追加オプションを含む要求画質
+
+        Returns:
+            None
+        """
         if self.info.video_id != video_id or self.info.quality != quality:
             raise OfflineVideoSessionError(409, 'session_mismatch')
 
     def _validateConnection(self, connection_id: int, *, is_new: bool) -> None:
+        """
+        有効なセッションに対する、新規接続または現接続からの要求であることを確認する。
+
+        Args:
+            connection_id (int): 要求元の接続番号
+            is_new (bool): 接続を引き継ぐ GET の場合は True
+
+        Returns:
+            None
+        """
         if self.is_closed:
             raise OfflineVideoSessionError(410, 'session_unavailable')
         if is_new and connection_id <= self._connection_id:
@@ -497,6 +561,15 @@ class OfflineVideoSession:
         self._renewLease()
 
     def _renewLease(self) -> None:
+        """
+        セッションの有効期限を現在時刻から更新し、回収タイマーを設定する。
+
+        Args:
+            なし
+
+        Returns:
+            None
+        """
         if self._lease_timer is not None:
             self._lease_timer.cancel()
         loop = asyncio.get_running_loop()
@@ -504,11 +577,29 @@ class OfflineVideoSession:
         self._lease_timer = loop.call_at(self._lease_deadline, self.close)
 
     def _releaseSegment(self, sequence: int) -> None:
+        """
+        保存確認済みで送信中の参照がないセグメントを解放する。
+
+        Args:
+            sequence (int): 解放するセグメントの連続番号
+
+        Returns:
+            None
+        """
         data, _ = self._retained.pop(sequence)
         self._retained_bytes -= len(data)
 
     @staticmethod
     def _recordingFields(video: RecordedVideo) -> tuple[int, str, str, int, datetime]:
+        """
+        セッションの作成時から変化していないことを確認する録画の属性を取り出す。
+
+        Args:
+            video (RecordedVideo): 照合対象の録画ファイルの DB レコード
+
+        Returns:
+            tuple[int, str, str, int, datetime]: 録画ファイルの ID・パス・ハッシュ・サイズ・更新日時
+        """
         return video.id, video.file_path, video.file_hash, video.file_size, video.file_modified_at
 
     @staticmethod
@@ -547,6 +638,9 @@ class OfflineVideoSession:
         """
         現在の録画情報と実ファイルをセッション作成時の録画と照合する。
 
+        Args:
+            なし
+
         Returns:
             bool | None: 録画が一致すれば True、変更されていれば False、一時的な I/O 障害なら None
         """
@@ -572,6 +666,15 @@ class OfflineVideoSession:
         return self._file_identity == file_identity
 
     async def _encode(self) -> None:
+        """
+        実行枠を取得し、先頭からエンコードして完了または失敗を通知する。
+
+        Args:
+            なし
+
+        Returns:
+            None
+        """
         try:
             # GET の応答は待機中もメタデータと keepalive を送信できる。
             async with OFFLINE_VIDEO_STREAM_SEMAPHORE:
@@ -595,6 +698,15 @@ class OfflineVideoSession:
             self.close()
 
     async def _cleanup(self) -> None:
+        """
+        エンコーダーと送信中の参照の終了を待ち、保持データとセッション登録を回収する。
+
+        Args:
+            なし
+
+        Returns:
+            None
+        """
         try:
             if self._encoding_task is not None and not self._encoding_task.done():
                 # 入力位置の探索や DB の待機も中断し、エンコード側の finally で資源を回収する。
@@ -625,9 +737,11 @@ class OfflineVideoSessionResponse(StreamingResponse):
         Returns:
             None
         """
-        # __call__() と stream_response() は、受理済みの接続番号と開始位置で同じセッションを参照する。
+        # __call__() は接続を登録し、stream_response() は同じセッションから本文を取得する
         self._session = session
+        # connect() が受理した接続番号。__call__() が登録を照合し、stream_response() が配信に使う
         self._connection_id = connection_id
+        # connect() が受理した再送開始位置。stream_response() が配信に使う
         self._next_sequence = next_sequence
         super().__init__(
             (),
@@ -636,10 +750,30 @@ class OfflineVideoSessionResponse(StreamingResponse):
         )
 
     async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+        """
+        セッションへの接続を登録し、引き継ぎや終了時に HTTP 応答を閉じる。
+
+        Args:
+            scope (Scope): HTTP リクエストの ASGI スコープ
+            receive (Receive): ASGI の受信関数
+            send (Send): ASGI の送信関数
+
+        Returns:
+            None
+        """
         is_started = False
         is_finished = False
 
         async def TrackResponse(message: Message) -> None:
+            """
+            HTTP 応答の開始と終了を記録しながら ASGI メッセージを送る。
+
+            Args:
+                message (Message): 送信する ASGI メッセージ
+
+            Returns:
+                None
+            """
             nonlocal is_started, is_finished
             # send() が通信待ちに入る前に、応答開始を記録する。
             if message['type'] == 'http.response.start':
@@ -649,13 +783,11 @@ class OfflineVideoSessionResponse(StreamingResponse):
                 is_finished = True
 
         with CancelScope() as response_scope:
+            # 応答開始前の引き継ぎや期限切れは、通常の API 例外ハンドラーに返す
             if not self._session.bindResponse(self._connection_id, response_scope):
                 if self._session.is_closed:
-                    error = OfflineVideoSessionError(410, 'session_unavailable')
-                else:
-                    error = OfflineVideoSessionError(409, 'stale_connection')
-                await JSONResponse({'detail': error.detail}, status_code=error.status_code)(scope, receive, send)
-                return
+                    raise OfflineVideoSessionError(410, 'session_unavailable')
+                raise OfflineVideoSessionError(409, 'stale_connection')
             try:
                 await super().__call__(scope, receive, TrackResponse)
             except (OSError, ClientDisconnect):
@@ -673,6 +805,15 @@ class OfflineVideoSessionResponse(StreamingResponse):
                 pass
 
     async def stream_response(self, send: Send) -> None:
+        """
+        セッションから取得したデータを HTTP 応答の本文として送る。
+
+        Args:
+            send (Send): ASGI の送信関数
+
+        Returns:
+            None
+        """
         await send({'type': 'http.response.start', 'status': self.status_code, 'headers': self.raw_headers})
         await self._session.stream(self._connection_id, self._next_sequence, send)
         await send({'type': 'http.response.body', 'body': b'', 'more_body': False})

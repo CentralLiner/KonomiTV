@@ -301,6 +301,7 @@ async def Shutdown():
     for live_stream in LiveStream.getAllLiveStreams():
         live_stream.setStatus('Offline', 'ライブストリームは Offline です。', True)
 
+    # オフライン保存セッションが所有するエンコーダーと接続を終了する
     await OfflineVideoSession.closeAll()
 
     # 全てのチューナーインスタンスを終了する (EDCB バックエンドのみ)

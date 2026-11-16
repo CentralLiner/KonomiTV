@@ -440,40 +440,6 @@ async def VideoOfflineStreamAPI(
     )
 
 
-@router.put(
-    '/{video_id}/{quality}/offline-sessions/{session_id}',
-    summary = '録画番組のオフライン保存セッション作成 API',
-    status_code = status.HTTP_201_CREATED,
-    responses = {status.HTTP_200_OK: {'model': OfflineVideoSessionInfo}},
-)
-async def VideoOfflineSessionCreateAPI(
-    session_id: Annotated[str, Path(pattern=r'^[0-9a-f]{32}$')],
-    recorded_program: Annotated[RecordedProgram, Depends(ValidateVideoID)],
-    stream_quality: Annotated[StreamQualityWithOptions, Depends(ValidateQuality)],
-    quality: str,
-    response: Response,
-) -> OfflineVideoSessionInfo:
-    """
-    オフライン保存用の RAM セッションを登録する。
-
-    Args:
-        session_id (str): クライアントが発行した保存 ID
-        recorded_program (RecordedProgram): 保存する録画番組
-        stream_quality (StreamQualityWithOptions): 検証済みの画質とエンコードオプション
-        quality (str): 追加オプションを含む要求画質
-        response (Response): 新規作成と再要求でステータスを切り替えるレスポンス
-
-    Returns:
-        OfflineVideoSessionInfo: 録画情報、画質、世代トークンを含むセッション情報
-    """
-
-    session, is_created = OfflineVideoSession.create(session_id, recorded_program, quality, stream_quality)
-    response.headers['Cache-Control'] = 'no-store'
-    if not is_created:
-        response.status_code = status.HTTP_200_OK
-    return session.info
-
-
 @router.get(
     '/{video_id}/{quality}/offline-sessions/{session_id}',
     summary = '録画番組のオフライン保存セッション接続 API',
@@ -507,6 +473,40 @@ async def VideoOfflineSessionStreamAPI(
         raise OfflineVideoSessionError(410, 'session_unavailable')
     await session.connect(connection_id, next_sequence)
     return OfflineVideoSessionResponse(session, connection_id, next_sequence)
+
+
+@router.put(
+    '/{video_id}/{quality}/offline-sessions/{session_id}',
+    summary = '録画番組のオフライン保存セッション作成 API',
+    status_code = status.HTTP_201_CREATED,
+    responses = {status.HTTP_200_OK: {'model': OfflineVideoSessionInfo}},
+)
+async def VideoOfflineSessionCreateAPI(
+    session_id: Annotated[str, Path(pattern=r'^[0-9a-f]{32}$')],
+    recorded_program: Annotated[RecordedProgram, Depends(ValidateVideoID)],
+    stream_quality: Annotated[StreamQualityWithOptions, Depends(ValidateQuality)],
+    quality: str,
+    response: Response,
+) -> OfflineVideoSessionInfo:
+    """
+    オフライン保存用の RAM セッションを登録する。
+
+    Args:
+        session_id (str): クライアントが発行した保存 ID
+        recorded_program (RecordedProgram): 保存する録画番組
+        stream_quality (StreamQualityWithOptions): 検証済みの画質とエンコードオプション
+        quality (str): 追加オプションを含む要求画質
+        response (Response): 新規作成と再要求でステータスを切り替えるレスポンス
+
+    Returns:
+        OfflineVideoSessionInfo: 録画情報、画質、世代トークンを含むセッション情報
+    """
+
+    session, is_created = OfflineVideoSession.create(session_id, recorded_program, quality, stream_quality)
+    response.headers['Cache-Control'] = 'no-store'
+    if not is_created:
+        response.status_code = status.HTTP_200_OK
+    return session.info
 
 
 @router.delete(

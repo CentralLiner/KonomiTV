@@ -139,6 +139,7 @@ class VideoStream:
             instance.recorded_program = recorded_program
             instance.quality = quality
             instance.encoding_options = encoding_options
+            # RAM 保存時だけ、エンコード結果と生存期限を管理するセッションを保持する
             instance.offline_session = offline_session
 
             # HLS セグメントの基準長 (秒)
@@ -379,6 +380,7 @@ class VideoStream:
         """
 
         # 終了処理へ入ったセッションは、待機中だった要求から生存期限を更新して復活させない
+        # RAM 保存の生存期限は OfflineVideoSession が管理する
         if self._is_destroyed is True or self._cancel_destroy_timer is None:
             return
 
@@ -393,6 +395,9 @@ class VideoStream:
         """
         RAM 保存用のエンコードを先頭から実行し、プロセスの終了まで待つ。
 
+        Args:
+            なし
+
         Returns:
             None
         """
@@ -406,6 +411,9 @@ class VideoStream:
     def segment_duration_seconds(self) -> float:
         """
         フレームレートから算出した通常セグメント長を返す。
+
+        Args:
+            なし
 
         Returns:
             float: セグメントの基準長 (秒)
