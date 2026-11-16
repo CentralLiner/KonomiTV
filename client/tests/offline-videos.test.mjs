@@ -396,19 +396,23 @@ test('サムネイルの書き込みに失敗しても Background Fetch を開�
 });
 
 for (const shouldCancel of [true, false]) {
-    const action = shouldCancel ? 'キャンセルでロックを解放する' : '準備の期限後に動画本体を保存する';
-    test(`WebRTC の Offer が未解決でも、${action}`, {timeout: 5000}, async (t) => {
+    const scenario = shouldCancel
+        ? 'WebRTC の Offer が未解決でもキャンセルでロックを解放する'
+        : 'WebRTC の最初の ICE 収集が終わらなければ5秒で動画本体の保存へ進む';
+    test(scenario, {timeout: 5000}, async (t) => {
         t.mock.timers.enable({apis: ['setTimeout']});
         const offerStarted = Promise.withResolvers();
         const closePeer = t.mock.fn();
         class PeerConnection extends EventTarget {
+            iceGatheringState = 'gathering';
             createDataChannel() { return {close() {}}; }
             close() { closePeer(); }
             createOffer() {
                 offerStarted.resolve();
                 // ブラウザは接続を閉じると作成中の Offer を確定しない場合がある。
-                return new Promise(() => {});
+                return shouldCancel ? new Promise(() => {}) : Promise.resolve({});
             }
+            async setLocalDescription() {}
         }
 
         const fixture = downloadFixture({peerConnection: PeerConnection});
@@ -422,7 +426,8 @@ for (const shouldCancel of [true, false]) {
         if (shouldCancel) {
             await fixture.service.cancel(job.job_id);
         } else {
-            t.mock.timers.tick(14_999);
+            await setImmediate();
+            t.mock.timers.tick(4999);
             assert.equal(closePeer.mock.callCount(), 0);
             t.mock.timers.tick(1);
         }

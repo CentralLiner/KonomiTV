@@ -1416,6 +1416,7 @@ export default class OfflineVideos {
 
     /**
      * 前景保存中のページ凍結を抑えるローカル WebRTC 接続を開始する。
+     * @param signal 保存ジョブのキャンセル通知
      * @returns WebRTC 接続を閉じる関数（利用できない環境では null）
      */
     private static async acquireForegroundActivityProtection(signal: AbortSignal): Promise<(() => void) | null> {
@@ -1435,15 +1436,16 @@ export default class OfflineVideos {
 
         const {controller, dispose} = this.linkAbortController(signal);
         const preparationSignal = controller.signal;
-        // Offer や Answer の生成も含めて、準備全体の待機時間を制限する。
-        const timeoutID = setTimeout(() => {
-            controller.abort(new Error('WebRTC のローカル接続準備がタイムアウトしました。'));
-        }, 15_000);
+        let readinessTimeout: ReturnType<typeof setTimeout> | undefined;
 
         const waitUntilReady = async (target: EventTarget, event: string, isReady: () => boolean): Promise<void> => {
             preparationSignal.throwIfAborted();
             if (isReady()) return;
             await new Promise<void>(resolve => {
+                // ICE 候補の収集と DataChannel の確立は、それぞれ最大5秒待つ。
+                readinessTimeout = setTimeout(() => {
+                    controller.abort(new Error('WebRTC のローカル接続準備がタイムアウトしました。'));
+                }, 5000);
                 const onReady = () => {
                     if (isReady()) {
                         target.removeEventListener(event, onReady);
@@ -1452,6 +1454,7 @@ export default class OfflineVideos {
                 };
                 target.addEventListener(event, onReady, {signal: preparationSignal});
             });
+            clearTimeout(readinessTimeout);
         };
 
         const connect = async (): Promise<void> => {
@@ -1492,7 +1495,7 @@ export default class OfflineVideos {
             closeConnections();
             throw error;
         } finally {
-            clearTimeout(timeoutID);
+            clearTimeout(readinessTimeout);
             dispose();
             controller.abort();
         }
