@@ -203,8 +203,8 @@
     <RecordedFileInfoDialog :program="program" v-model:show="show_video_info" />
     <OfflineVideoDownloadDialog :program="program" v-model:show="showOfflineDownload" />
 
-    <v-dialog v-model="showOfflineJobDismissConfirmation" max-width="420">
-        <v-card v-if="offlineJobToDismiss !== null">
+    <v-dialog v-if="offlineJobToDismiss !== null" v-model="showOfflineJobDismissConfirmation" max-width="420">
+        <v-card>
             <v-card-title class="d-flex justify-center pt-6 font-weight-bold">
                 失敗した保存を削除しますか？
             </v-card-title>

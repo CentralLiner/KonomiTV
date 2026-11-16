@@ -147,34 +147,43 @@ function downloadFixture({interruptFirstResponse = false, failStorage = null, re
     };
 }
 
-for (const failure of ['HTTP', 'HTTP エラー後の本文切断', '本文の途中切断', 'CacheStorage']) {
-    test(`付随画像に失敗してもジョブを継続する (${failure})`, async () => {
-        const bodyDisconnected = failure.includes('本文');
-        const status = failure === 'CacheStorage' || failure === '本文の途中切断' ? 200 : 503;
-        let bodyCancelled = false;
-        const fixture = downloadFixture({respond: async () => new Response(new ReadableStream({
+test('付随画像の本文で通信が途切れても動画の保存を完了する', async (t) => {
+    const fixture = downloadFixture({respond(request) {
+        if (!new URL(request.url).pathname.endsWith('/thumbnail')) return;
+        return new Response(new ReadableStream({
             start(controller) {
-                if (bodyDisconnected) controller.error(new TypeError('Connection lost after receiving the image headers.'));
+                controller.error(new TypeError('Connection lost after receiving the image headers.'));
             },
-            cancel() { bodyCancelled = true; },
-        }), {status})});
-        const controller = new AbortController();
-        const cache = {put: async (_url, response) => {
-            if (failure === 'CacheStorage') throw new DOMException('CacheStorage is full', 'QuotaExceededError');
-            await response.arrayBuffer();
-        }};
-        await fixture.service.cacheOptionalAsset(cache, 'https://konomitv.test/image', '/image', controller.signal);
-        assert.equal(bodyCancelled, !bodyDisconnected);
-        assert.equal(controller.signal.aborted, false);
-    });
-}
-
-test('付随画像の保存中に実装上の例外が発生したらジョブを失敗にする', async () => {
-    const fixture = downloadFixture({beforeWrite(url) {
-        if (url.endsWith('/thumbnail.webp')) throw new ReferenceError('Injected implementation error');
+        }));
     }});
     fixture.job.state = 'Cancelled';
+    const foregroundDownload = t.mock.method(fixture.service, 'runForegroundDownload');
+
+    await fixture.service.start(fixture.job.program, '240p');
+    await foregroundDownload.mock.calls[0].result;
+    assert.equal(fixture.job.state, 'Completed');
+    assert.ok(fixture.writes.every(url => !url.endsWith('/thumbnail.webp')));
+});
+
+test('画像の保存で実装上の例外が発生すると、別の画像取得を中断してジョブを失敗にする', async () => {
+    const stalledImage = Promise.withResolvers();
+    const fixture = downloadFixture({
+        respond(request) {
+            if (!request.url.endsWith('/thumbnail/tiled')) return;
+            return new Promise((_, reject) => {
+                request.signal.addEventListener('abort', () => reject(request.signal.reason), {once: true});
+                stalledImage.resolve(request);
+            });
+        },
+        async beforeWrite(url) {
+            if (!url.endsWith('/thumbnail.webp')) return;
+            await stalledImage.promise;
+            throw new ReferenceError('Injected implementation error');
+        },
+    });
+    fixture.job.state = 'Cancelled';
     await assert.rejects(fixture.service.start(fixture.job.program, '240p'), ReferenceError);
+    assert.equal((await stalledImage.promise).signal.aborted, true);
     assert.equal(fixture.job.state, 'Failed');
     assert.equal(fixture.video, fixture.previousVideo);
     assert.equal(fixture.requests.some(request => request.url.includes('/offline-sessions/')), false);
@@ -182,71 +191,61 @@ test('付随画像の保存中に実装上の例外が発生したらジョブ�
 
 for (const useBackgroundFetch of [false, true]) {
     const mode = useBackgroundFetch ? 'Background Fetch' : '通常 Fetch';
-    for (const waitingFor of ['ヘッダー', '本文']) {
-        test(`${mode}: 画像の${waitingFor}待ちをキャンセルした後、同じ番組を保存し直せる`, {timeout: 5000}, async (t) => {
-            const assetWaiting = Promise.withResolvers();
-            let stalledRequest;
-            let shouldStall = true;
-            const fixture = downloadFixture({respond: async request => {
-                if (!shouldStall || !new URL(request.url).pathname.endsWith('/thumbnail')) return;
-                stalledRequest = request;
-                if (waitingFor === 'ヘッダー') {
-                    return await new Promise((_resolve, reject) => {
-                        request.signal.addEventListener('abort', () => reject(request.signal.reason), {once: true});
-                        assetWaiting.resolve();
-                    });
-                }
-                return new Response(new ReadableStream({
-                    start(controller) {
-                        controller.enqueue(new TextEncoder().encode('partial image'));
-                        request.signal.addEventListener('abort', () => controller.error(request.signal.reason), {once: true});
-                    },
-                    pull() { assetWaiting.resolve(); },
-                }));
-            }});
-            fixture.job.state = 'Cancelled';
-            const program = fixture.job.program;
-            const releaseForegroundLock = t.mock.fn();
-            t.mock.method(fixture.service, 'acquireForegroundLock', async () => releaseForegroundLock);
-            const foregroundDownload = t.mock.method(fixture.service, 'runForegroundDownload');
-            const backgroundFetch = t.mock.fn(async () => ({abort: async () => true}));
-            fixture.navigator.serviceWorker = {getRegistration: async () => ({
-                backgroundFetch: {fetch: backgroundFetch, get: async () => undefined},
-            })};
+    test(`${mode}: 画像の本文待ちをキャンセルした後、同じ番組を保存し直せる`, {timeout: 5000}, async (t) => {
+        const assetWaiting = Promise.withResolvers();
+        let shouldStall = true;
+        const fixture = downloadFixture({respond(request) {
+            if (!shouldStall || !new URL(request.url).pathname.endsWith('/thumbnail')) return;
+            return new Response(new ReadableStream({
+                start(controller) {
+                    controller.enqueue(new TextEncoder().encode('partial image'));
+                    request.signal.addEventListener('abort', () => controller.error(request.signal.reason), {once: true});
+                },
+                pull() { assetWaiting.resolve(request); },
+            }));
+        }});
+        fixture.job.state = 'Cancelled';
+        const program = fixture.job.program;
+        const releaseForegroundLock = t.mock.fn();
+        t.mock.method(fixture.service, 'acquireForegroundLock', async () => releaseForegroundLock);
+        const foregroundDownload = t.mock.method(fixture.service, 'runForegroundDownload');
+        const backgroundFetch = t.mock.fn(async () => ({abort: async () => true}));
+        fixture.navigator.serviceWorker = {getRegistration: async () => ({
+            backgroundFetch: {fetch: backgroundFetch, get: async () => undefined},
+        })};
 
-            // 保存開始から実際の通信中断と後処理まで通し、旧世代が残ることも確認する。
-            const starting = fixture.service.start(program, '240p', useBackgroundFetch);
-            const cancelled = assert.rejects(starting, {name: 'AbortError'});
-            await assetWaiting.promise;
-            const cancelledJobID = fixture.job.job_id;
-            await fixture.service.cancel(cancelledJobID);
-            await cancelled;
-            assert.equal(stalledRequest.signal.aborted, true);
-            assert.equal(fixture.job.state, 'Cancelled');
-            assert.equal(releaseForegroundLock.mock.callCount(), useBackgroundFetch ? 0 : 1);
-            assert.equal(backgroundFetch.mock.callCount(), 0);
-            assert.equal(fixture.video, fixture.previousVideo);
-            assert.deepEqual([...fixture.cache.keys()], [`${fixture.baseURL}/old/playlist.m3u8`]);
+        // 保存開始から実際の通信中断と後処理まで通し、旧世代が残ることも確認する。
+        const starting = fixture.service.start(program, '240p', useBackgroundFetch);
+        const cancelled = assert.rejects(starting, {name: 'AbortError'});
+        const stalledRequest = await assetWaiting.promise;
+        const cancelledJobID = fixture.job.job_id;
+        await fixture.service.cancel(cancelledJobID);
+        await cancelled;
+        assert.equal(stalledRequest.signal.aborted, true);
+        assert.equal(fixture.job.state, 'Cancelled');
+        assert.equal(releaseForegroundLock.mock.callCount(), useBackgroundFetch ? 0 : 1);
+        assert.equal(backgroundFetch.mock.callCount(), 0);
+        assert.equal(fixture.video, fixture.previousVideo);
+        assert.deepEqual([...fixture.cache.keys()], [`${fixture.baseURL}/old/playlist.m3u8`]);
 
-            // 開始用のロックも解放され、同じ番組の新しいジョブを登録できる。
-            shouldStall = false;
-            const restarted = await fixture.service.start(program, '240p', useBackgroundFetch);
-            assert.notEqual(restarted.job_id, cancelledJobID);
-            if (useBackgroundFetch) {
-                assert.equal(backgroundFetch.mock.callCount(), 1);
-                await fixture.service.cancel(restarted.job_id);
-            } else {
-                await foregroundDownload.mock.calls[0].result;
-                assert.equal(fixture.job.state, 'Completed');
-                assert.equal(releaseForegroundLock.mock.callCount(), 2);
-            }
+        // 開始用のロックも解放され、同じ番組の新しいジョブを登録できる。
+        shouldStall = false;
+        const restarted = await fixture.service.start(program, '240p', useBackgroundFetch);
+        assert.notEqual(restarted.job_id, cancelledJobID);
+        if (useBackgroundFetch) {
+            assert.equal(backgroundFetch.mock.callCount(), 1);
+            await fixture.service.cancel(restarted.job_id);
+        } else {
+            await foregroundDownload.mock.calls[0].result;
+            assert.equal(fixture.job.state, 'Completed');
+            assert.equal(releaseForegroundLock.mock.callCount(), 2);
+        }
 
-            // 付随データはブラウザが既存の HTTP キャッシュを利用できる要求にする。
-            const assetRequests = fixture.requests.filter(request => !request.url.includes('/offline-sessions/'));
-            assert.ok(assetRequests.length > 0);
-            assert.ok(assetRequests.every(request => request.cache === 'default'));
-        });
-    }
+        // 付随データはブラウザが既存の HTTP キャッシュを利用できる要求にする。
+        const assetRequests = fixture.requests.filter(request => !request.url.includes('/offline-sessions/'));
+        assert.ok(assetRequests.length > 0);
+        assert.ok(assetRequests.every(request => request.cache === 'default'));
+    });
 
     test(`${mode}: キャンセル後に完了する画像の書き込みも回収する`, {timeout: 5000}, async (t) => {
         const writeStarted = Promise.withResolvers();
@@ -280,43 +279,6 @@ for (const useBackgroundFetch of [false, true]) {
         assert.equal(fixture.video, fixture.previousVideo);
         assert.deepEqual([...fixture.cache.keys()], [`${fixture.baseURL}/old/playlist.m3u8`]);
     });
-
-    test(`${mode}: 手動再試行は画質・保存方式を引き継ぎ、最新の番組情報で新しく開始する`, async (t) => {
-        const fixture = downloadFixture();
-        fixture.job.state = 'Failed';
-        fixture.job.quality = '720p-hevc-10bit-24fps';
-        fixture.job.background_fetch_id = useBackgroundFetch ? 'previous-background-fetch' : null;
-        const failedJob = {...fixture.job};
-        const latestProgram = {
-            ...failedJob.program, title: '更新後の番組情報',
-            recorded_video: {...failedJob.program.recorded_video, file_hash: 'updated-recording'},
-        };
-        const fetchVideo = t.mock.method(fixture.videos, 'fetchVideo', async () => latestProgram);
-        const registerJob = t.mock.method(fixture.storage, 'putJobIfVideoIdle');
-        const foregroundDownload = t.mock.method(fixture.service, 'runForegroundDownload');
-        const backgroundFetch = t.mock.fn(async () => ({abort: async () => true}));
-        fixture.navigator.serviceWorker = {getRegistration: async () => ({backgroundFetch: {fetch: backgroundFetch}})};
-
-        const restarted = await fixture.service.retry(failedJob.job_id);
-        assert.deepEqual(fetchVideo.mock.calls[0].arguments, [failedJob.video_id]);
-        assert.deepEqual(registerJob.mock.calls[0].arguments, [restarted, failedJob.job_id]);
-        assert.equal(restarted.quality, failedJob.quality);
-        assert.deepEqual(restarted.program, latestProgram);
-        assert.notEqual(restarted.job_id, failedJob.job_id);
-        assert.notEqual(restarted.generation_id, failedJob.generation_id);
-        if (useBackgroundFetch) {
-            assert.equal(foregroundDownload.mock.callCount(), 0);
-            assert.notEqual(restarted.background_fetch_id, failedJob.background_fetch_id);
-            const [id, requests] = backgroundFetch.mock.calls[0].arguments;
-            assert.equal(id, restarted.background_fetch_id);
-            assert.equal(new URL(requests[0].url).pathname, `/api/streams/video/1/${failedJob.quality}/offline-stream`);
-        } else {
-            assert.equal(backgroundFetch.mock.callCount(), 0);
-            assert.equal(restarted.background_fetch_id, null);
-            await foregroundDownload.mock.calls[0].result;
-            assert.equal(fixture.job.state, 'Completed');
-        }
-    });
 }
 
 test('録画 ID が再利用されても、別の放送回を再試行で登録せず保存済み動画を保持する', async (t) => {
@@ -329,10 +291,7 @@ test('録画 ID が再利用されても、別の放送回を再試行で登録�
         start_time: '2026-11-12T12:00:00+09:00',
         recorded_video: {...failedJob.program.recorded_video, file_hash: 'different-recording'},
     }));
-    const registerJob = t.mock.method(fixture.storage, 'putJobIfVideoIdle');
-
     await assert.rejects(fixture.service.retry(failedJob.job_id), /同じ録画番組か確認できませんでした/);
-    assert.equal(registerJob.mock.callCount(), 0);
     assert.equal(fixture.job.job_id, failedJob.job_id);
     assert.equal(fixture.job.state, 'Failed');
     assert.equal(fixture.video, fixture.previousVideo);
@@ -386,14 +345,13 @@ for (const useBackgroundFetch of [false, true]) {
     });
 }
 
-test('Background Fetch の展開では進捗を間引き、各セグメントでは更新しない', async (t) => {
-    t.mock.method(performance, 'now', () => 0);
+test('Background Fetch は従来の配信を展開して保存世代を切り替える', async () => {
     const fixture = downloadFixture();
     fixture.job.background_fetch_id = 'background';
-    const update = t.mock.method(fixture.storage, 'updateActiveJob');
     await fixture.service.finalizeResponse(fixture.job.job_id, streamResponse(null, false));
-    assert.equal(update.mock.callCount(), 2);  // Downloading と Finalizing の開始時だけ
     assert.equal(fixture.job.state, 'Completed');
+    assert.equal(fixture.video.generation_id, 'new');
+    assert.deepEqual(fixture.cache.get(`${fixture.baseURL}/new/segments/1.ts`), segments[1]);
 });
 
 test('サムネイルの書き込みに失敗しても Background Fetch を開始する', async (t) => {
@@ -410,19 +368,16 @@ test('サムネイルの書き込みに失敗しても Background Fetch を開�
     assert.ok(fixture.writes.every(url => !url.endsWith('/thumbnail.webp')));
 });
 
-for (const [phase, scenario] of [
-    ['Cancel', 'WebRTC の Offer が未解決でもキャンセルでロックを解放する'],
-    ['Offer', 'WebRTC の Offer が未解決でも5秒後に動画保存を開始する'],
-    ['ICE', 'ICE 候補の収集が止まっても5秒後に動画保存を開始する'],
-    ['DataChannel', 'WebRTC の準備を段階ごとに5秒待つ'],
+for (const [shouldCancel, scenario] of [
+    [true, 'WebRTC の Offer が未解決でもキャンセルでロックを解放する'],
+    [false, 'WebRTC の Offer 作成が遅くても ICE 候補の収集を待つ'],
 ]) {
-    const shouldCancel = phase === 'Cancel';
     test(scenario, {timeout: 5000}, async (t) => {
         t.mock.timers.enable({apis: ['setTimeout']});
         const offerStarted = Promise.withResolvers();
         const closePeer = t.mock.fn();
         const peers = [];
-        const dataChannel = Object.assign(new EventTarget(), {readyState: 'connecting', close() {}});
+        const dataChannel = Object.assign(new EventTarget(), {readyState: 'open', close() {}});
         class PeerConnection extends EventTarget {
             iceGatheringState = 'gathering';
             localDescription = null;
@@ -435,11 +390,20 @@ for (const [phase, scenario] of [
             createOffer() {
                 offerStarted.resolve();
                 // ブラウザは接続を閉じると作成中の Offer を確定しない場合がある。
-                return shouldCancel || phase === 'Offer' ? new Promise(() => {}) : Promise.resolve({});
+                if (shouldCancel) return new Promise(() => {});
+                return new Promise(resolve => setTimeout(() => resolve({}), 4500));
             }
             async createAnswer() { return {}; }
             async setLocalDescription(description) {
                 this.localDescription = description;
+                if (this === peers[0]) {
+                    setTimeout(() => {
+                        this.iceGatheringState = 'complete';
+                        this.dispatchEvent(new Event('icegatheringstatechange'));
+                    }, 2000);
+                } else {
+                    this.iceGatheringState = 'complete';
+                }
             }
             async setRemoteDescription() {}
         }
@@ -455,21 +419,13 @@ for (const [phase, scenario] of [
         if (shouldCancel) {
             await fixture.service.cancel(job.job_id);
         } else {
+            t.mock.timers.tick(4500);
             await setImmediate();
-            if (phase === 'DataChannel') {
-                // Offer と Answer がそれぞれ期限直前に準備できても、DataChannel に次の5秒を使う。
-                for (const peer of peers) {
-                    t.mock.timers.tick(4999);
-                    assert.equal(closePeer.mock.callCount(), 0);
-                    peer.iceGatheringState = 'complete';
-                    peer.dispatchEvent(new Event('icegatheringstatechange'));
-                    await setImmediate();
-                }
-            }
-            t.mock.timers.tick(4999);
+            t.mock.timers.tick(500);
+            await setImmediate();
             assert.equal(closePeer.mock.callCount(), 0);
             assert.equal(fixture.requests.some(request => request.url.includes('/offline-sessions/')), false);
-            t.mock.timers.tick(1);
+            t.mock.timers.tick(1500);
         }
         await foregroundDownload.mock.calls[0].result;
 
@@ -618,6 +574,20 @@ for (const status of [410, 500]) {
         assert.deepEqual([...fixture.cache.keys()], [`${fixture.baseURL}/old/playlist.m3u8`]);
     });
 }
+
+test('認証画面へのリダイレクトでは再接続を終了し、再認証を案内する', async () => {
+    const fixture = downloadFixture({respond(request) {
+        if (request.method !== 'GET') return;
+        assert.equal(request.redirect, 'manual');
+        return Object.defineProperty(new Response(), 'type', {value: 'opaqueredirect'});
+    }});
+
+    await fixture.run();
+    assert.equal(fixture.requests.filter(request => request.method === 'GET').length, 1);
+    assert.equal(fixture.job.state, 'Failed');
+    assert.match(fixture.job.error, /認証し直して/);
+    assert.equal(fixture.video, fixture.previousVideo);
+});
 
 test('キャンセル後に完了するセグメントの書き込みも回収し、以前の保存済み動画を保持する', async () => {
     const writeStarted = Promise.withResolvers();

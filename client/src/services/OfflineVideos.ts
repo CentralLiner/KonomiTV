@@ -253,6 +253,7 @@ export default class OfflineVideos {
      * @param program 保存する録画番組
      * @param quality 追加オプションを含む API 画質
      * @param useBackgroundFetch ダイアログでバックグラウンド保存が選ばれたか (未対応環境では前景 Fetch を使う)
+     * @param retryJobID 一覧から再試行する場合に引き継ぐ失敗ジョブの ID
      * @returns 作成した保存ジョブ
      */
     static async start(
@@ -418,15 +419,17 @@ export default class OfflineVideos {
             assets.push({source: `${Utils.api_base_url}/channels/${job.program.channel.id}/logo`, name: 'channel-logo'});
         }
 
-        // 終了時の世代回収より先にすべての cache.put() が決着するように待つ。
-        const results = await Promise.allSettled(assets.map(asset =>
-            this.cacheOptionalAsset(cache, asset.source, `${baseURL}/assets/${asset.name}`, signal),
-        ));
-        signal.throwIfAborted();
-        for (const result of results) {
-            if (result.status === 'rejected') {
-                throw result.reason;
-            }
+        const {controller, dispose} = this.linkAbortController(signal);
+        try {
+            // 準備を続けられない例外では残りの画像取得を中断し、世代回収の前に書き込みの終了を待つ。
+            await Promise.all(assets.map(asset =>
+                this.cacheOptionalAsset(cache, asset.source, `${baseURL}/assets/${asset.name}`, controller.signal)
+                    .catch((error: unknown) => controller.abort(error)),
+            ));
+            signal.throwIfAborted();
+            controller.signal.throwIfAborted();
+        } finally {
+            dispose();
         }
         await this.updateJob(job);
 
@@ -551,14 +554,29 @@ export default class OfflineVideos {
                         throw new Error('通信を再開できませんでした。');
                     }
                     connectionID++;
-                    const response = await this.openSessionStream(
-                        url, sessionInfo, nextSequence, connectionID, connection.controller,
-                    );
+                    const connectionSignal = connection.controller.signal;
+                    const timeout = setTimeout(() => connection.controller.abort(
+                        new OfflineDownloadNetworkError('オフライン保存の接続がタイムアウトしました。'),
+                    ), 30_000);
+                    let response: Response;
+                    try {
+                        response = await this.fetchResponse(`${url}?next_sequence=${nextSequence}&connection_id=${connectionID}`, {
+                            headers: {'X-KonomiTV-Offline-Generation': sessionInfo.generation_token},
+                            signal: connectionSignal,
+                        });
+                        connectionSignal.throwIfAborted();
+                        await this.checkSessionResponse(response, connectionSignal);
+                        if (response.status !== 200) {
+                            throw new Error('オフライン保存の配信応答が不正です。');
+                        }
+                    } finally {
+                        clearTimeout(timeout);
+                    }
                     job.state = 'Downloading';
                     await this.updateJob(job);
-                    checkpointTask = this.sendCheckpoints(url, sessionInfo, connectionID, progress, connection.controller.signal)
+                    checkpointTask = this.sendCheckpoints(url, sessionInfo, connectionID, progress, connectionSignal)
                         .catch((error: unknown) => {
-                            if (connection.controller.signal.aborted === false) {
+                            if (connectionSignal.aborted === false) {
                                 checkpointError = error;
                                 connection.controller.abort();
                             }
@@ -683,30 +701,6 @@ export default class OfflineVideos {
         }
     }
 
-    private static async openSessionStream(
-        url: string,
-        info: IOfflineVideoSessionInfo,
-        nextSequence: number,
-        connectionID: number,
-        controller: AbortController,
-    ): Promise<Response> {
-        const timeout = setTimeout(() => controller.abort(new OfflineDownloadNetworkError('オフライン保存の接続がタイムアウトしました。')), 30_000);
-        try {
-            const response = await this.fetchResponse(`${url}?next_sequence=${nextSequence}&connection_id=${connectionID}`, {
-                headers: {'X-KonomiTV-Offline-Generation': info.generation_token},
-                signal: controller.signal,
-            });
-            controller.signal.throwIfAborted();
-            await this.checkSessionResponse(response, controller.signal);
-            if (response.status !== 200) {
-                throw new Error('オフライン保存の配信応答が不正です。');
-            }
-            return response;
-        } finally {
-            clearTimeout(timeout);
-        }
-    }
-
     private static async sendCheckpoints(
         url: string,
         info: IOfflineVideoSessionInfo,
@@ -756,15 +750,21 @@ export default class OfflineVideos {
     }
 
     private static async fetchResponse(url: string, options: RequestInit): Promise<Response> {
-        const request = new Request(url, {...options, redirect: 'error'});
+        // 手動でリダイレクトを判別し、認証画面への誘導と通信エラーを区別する。
+        const request = new Request(url, {...options, redirect: 'manual'});
+        let response: Response;
         try {
-            return await fetch(request);
+            response = await fetch(request);
         } catch (error) {
             if (options.signal?.aborted || error instanceof TypeError || (error instanceof DOMException && error.name === 'NetworkError')) {
                 throw new OfflineDownloadNetworkError('オフライン保存の通信が途切れました。');
             }
             throw error;
         }
+        if (response.type === 'opaqueredirect') {
+            throw new Error('サーバーへの接続先が変更されました。認証が必要な場合は、認証し直してからオフライン保存をやり直してください。');
+        }
+        return response;
     }
 
     private static async checkSessionResponse(response: Response, signal: AbortSignal): Promise<void> {
@@ -1449,18 +1449,13 @@ export default class OfflineVideos {
         const preparationSignal = controller.signal;
         let preparationTimeout: ReturnType<typeof setTimeout> | undefined;
 
-        const startPreparationStage = (): void => {
-            preparationSignal.throwIfAborted();
-            clearTimeout(preparationTimeout);
-            // Offer、Answer、DataChannel の準備には段階ごとに5秒の猶予を設ける。
-            preparationTimeout = setTimeout(() => {
-                controller.abort(new Error('WebRTC のローカル接続準備がタイムアウトしました。'));
-            }, 5000);
-        };
-
         const waitUntilReady = async (target: EventTarget, event: string, isReady: () => boolean): Promise<void> => {
             preparationSignal.throwIfAborted();
             if (isReady()) return;
+            // ICE 候補の収集と DataChannel の確立を、それぞれ待ち始めてから5秒待つ。
+            preparationTimeout = setTimeout(() => {
+                controller.abort(new Error('WebRTC のローカル接続準備がタイムアウトしました。'));
+            }, 5000);
             await new Promise<void>(resolve => {
                 const onReady = () => {
                     if (isReady()) {
@@ -1470,6 +1465,7 @@ export default class OfflineVideos {
                 };
                 target.addEventListener(event, onReady, {signal: preparationSignal});
             });
+            clearTimeout(preparationTimeout);
         };
 
         const connect = async (): Promise<void> => {
@@ -1478,14 +1474,12 @@ export default class OfflineVideos {
             }, {once: true, signal: preparationSignal});
 
             // ICE 候補を含む Offer / Answer を同一ページ内で交換し、ネットワーク上の相手を必要としない接続にする
-            startPreparationStage();
             await offerPeerConnection.setLocalDescription(await offerPeerConnection.createOffer());
             await waitUntilReady(offerPeerConnection, 'icegatheringstatechange', () => offerPeerConnection.iceGatheringState === 'complete');
             const offerDescription = offerPeerConnection.localDescription;
             if (offerDescription === null) {
                 throw new Error('WebRTC の Offer を作成できませんでした。');
             }
-            startPreparationStage();
             await answerPeerConnection.setRemoteDescription(offerDescription);
             await answerPeerConnection.setLocalDescription(await answerPeerConnection.createAnswer());
             await waitUntilReady(answerPeerConnection, 'icegatheringstatechange', () => answerPeerConnection.iceGatheringState === 'complete');
@@ -1493,7 +1487,6 @@ export default class OfflineVideos {
             if (answerDescription === null) {
                 throw new Error('WebRTC の Answer を作成できませんでした。');
             }
-            startPreparationStage();
             await offerPeerConnection.setRemoteDescription(answerDescription);
 
             // Chrome が保護対象と判定するのは開いた DataChannel なので、接続完了後に動画転送へ進む
