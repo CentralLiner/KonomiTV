@@ -49,6 +49,7 @@ function downloadFixture({interruptFirstResponse = false, failStorage = null, re
         job_id: 'job', video_id: 1, generation_id: 'new', quality: '240p',
         program: {
             id: 1, title: '保存する番組', channel: null,
+            network_id: 32736, service_id: 1024, event_id: 12, start_time: '2026-11-10T12:00:00+09:00',
             recorded_video: {file_hash: 'recording', duration: 12},
         },
         state: 'Waiting', downloaded_bytes: 0, background_fetch_id: null, error: null,
@@ -146,16 +147,20 @@ function downloadFixture({interruptFirstResponse = false, failStorage = null, re
     };
 }
 
-for (const failure of ['HTTP', 'CacheStorage']) {
-    test(`付随画像の${failure}エラーで未読の本文を中止し、ジョブは中止しない`, async () => {
+for (const failure of ['HTTP', 'HTTP エラー後の本文切断', 'CacheStorage']) {
+    test(`付随画像に失敗してもジョブを継続する (${failure})`, async () => {
+        const bodyDisconnected = failure === 'HTTP エラー後の本文切断';
         let bodyCancelled = false;
         const fixture = downloadFixture({respond: async () => new Response(new ReadableStream({
+            start(controller) {
+                if (bodyDisconnected) controller.error(new TypeError('Connection lost after receiving the image headers.'));
+            },
             cancel() { bodyCancelled = true; },
-        }), {status: failure === 'HTTP' ? 503 : 200})});
+        }), {status: failure === 'CacheStorage' ? 200 : 503})});
         const controller = new AbortController();
         const cache = {put: async () => { throw new DOMException('CacheStorage is full', 'QuotaExceededError'); }};
         await fixture.service.cacheOptionalAsset(cache, 'https://konomitv.test/image', '/image', controller.signal);
-        assert.equal(bodyCancelled, true);
+        assert.equal(bodyCancelled, !bodyDisconnected);
         assert.equal(controller.signal.aborted, false);
     });
 }
@@ -298,6 +303,26 @@ for (const useBackgroundFetch of [false, true]) {
         }
     });
 }
+
+test('録画 ID が再利用されても、別の放送回を再試行で登録せず保存済み動画を保持する', async (t) => {
+    const fixture = downloadFixture();
+    fixture.job.state = 'Failed';
+    const failedJob = fixture.job;
+    t.mock.method(fixture.videos, 'fetchVideo', async () => ({
+        ...failedJob.program,
+        // 番組番号が循環した後の別の放送回を、DB が同じ録画 ID で返す。
+        start_time: '2026-11-12T12:00:00+09:00',
+        recorded_video: {...failedJob.program.recorded_video, file_hash: 'different-recording'},
+    }));
+    const registerJob = t.mock.method(fixture.storage, 'putJobIfVideoIdle');
+
+    await assert.rejects(fixture.service.retry(failedJob.job_id), /同じ録画番組か確認できませんでした/);
+    assert.equal(registerJob.mock.callCount(), 0);
+    assert.equal(fixture.job.job_id, failedJob.job_id);
+    assert.equal(fixture.job.state, 'Failed');
+    assert.equal(fixture.video, fixture.previousVideo);
+    assert.deepEqual([...fixture.cache.keys()], [`${fixture.baseURL}/old/playlist.m3u8`]);
+});
 
 for (const useBackgroundFetch of [false, true]) {
     const mode = useBackgroundFetch ? 'Background Fetch' : '通常 Fetch';

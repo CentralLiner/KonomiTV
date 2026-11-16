@@ -392,6 +392,18 @@ export default class OfflineVideos {
         if (program === null) {
             throw new Error('録画番組の情報を取得できませんでした。');
         }
+
+        // DB 再構築で同じ ID に別の録画が割り当てられることがある。差し替え前後の録画は放送回で照合する。
+        const previousProgram = failedJob.program;
+        const previousFileHash = previousProgram.recorded_video.file_hash;
+        const isSameFile = Boolean(previousFileHash) && program.recorded_video.file_hash === previousFileHash;
+        const isSameBroadcast = typeof previousProgram.network_id === 'number' && program.network_id === previousProgram.network_id &&
+            typeof previousProgram.service_id === 'number' && program.service_id === previousProgram.service_id &&
+            typeof previousProgram.event_id === 'number' && program.event_id === previousProgram.event_id &&
+            typeof previousProgram.start_time === 'string' && program.start_time === previousProgram.start_time;
+        if (!isSameFile && !isSameBroadcast) {
+            throw new Error('同じ録画番組か確認できませんでした。録画番組の画面から保存を開始してください。');
+        }
         return await this.start(program, failedJob.quality, failedJob.background_fetch_id !== null, jobID);
     }
 
@@ -468,7 +480,10 @@ export default class OfflineVideos {
         } finally {
             // HTTP エラーや書き込み開始前の失敗では、未読の本文のダウンロードを残さない。
             if (response !== undefined && !response.bodyUsed && !signal.aborted) {
-                await response.body?.cancel();
+                await response.body?.cancel().catch((error: unknown) => {
+                    signal.throwIfAborted();
+                    console.warn('[OfflineVideos] Failed to cancel an optional offline asset response body:', error);
+                });
             }
         }
     }
