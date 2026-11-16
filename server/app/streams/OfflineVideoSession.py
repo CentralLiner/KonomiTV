@@ -343,24 +343,26 @@ class OfflineVideoSession:
         return video.id, video.file_path, video.file_hash, video.file_size, video.file_modified_at
 
     @staticmethod
-    def _getFileIdentity(video: RecordedVideo) -> tuple[int, int, int, int, int] | None:
+    def _getFileIdentity(video: RecordedVideo, *, verify_hash: bool) -> tuple[int, int, int, int, int] | None:
         # ハッシュの計算とファイル操作はワーカースレッドで行う。
         path = Path(video.file_path)
         try:
             before = path.stat()
             if before.st_size != video.file_size:
                 return None
+            identity = (before.st_dev, before.st_ino, before.st_size, before.st_mtime_ns, before.st_ctime_ns)
             # 同じ内容なら録画スキャンは DB の更新日時を更新しない。初回はサイズとハッシュを照合し、
             # 以後の更新日時の変化はセッションが保持する実ファイルの identity で検出する。
-            if not MetadataAnalyzer(path).matchesFileHash(video.file_hash):
-                return None
-            after = path.stat()
+            if verify_hash:
+                if not MetadataAnalyzer(path).matchesFileHash(video.file_hash):
+                    return None
+                # 読み取ったハッシュと記録する識別情報を同じファイルのものにそろえる。
+                after = path.stat()
+                if identity != (after.st_dev, after.st_ino, after.st_size, after.st_mtime_ns, after.st_ctime_ns):
+                    return None
+            return identity
         except (OSError, ValueError):
             return None
-        identity = (before.st_dev, before.st_ino, before.st_size, before.st_mtime_ns, before.st_ctime_ns)
-        if identity != (after.st_dev, after.st_ino, after.st_size, after.st_mtime_ns, after.st_ctime_ns):
-            return None
-        return identity
 
     async def _matchesRecording(self) -> bool:
         recorded_program = await RecordedProgram.filter(id=self.info.video_id).get_or_none().select_related('recorded_video')
@@ -368,7 +370,11 @@ class OfflineVideoSession:
             return False
         if self._recordingFields(recorded_program.recorded_video) != self._recordingFields(self._recorded_program.recorded_video):
             return False
-        file_identity = await asyncio.to_thread(self._getFileIdentity, recorded_program.recorded_video)
+        file_identity = await asyncio.to_thread(
+            self._getFileIdentity,
+            recorded_program.recorded_video,
+            verify_hash=self._file_identity is None,
+        )
         if file_identity is None:
             return False
         if self._file_identity is None:
@@ -401,8 +407,6 @@ class OfflineVideoSession:
     async def _cleanup(self) -> None:
         try:
             if self._encoding_task is not None and not self._encoding_task.done():
-                if self._stream is not None:
-                    self._stream.cancelOfflineEncoding()
                 # 入力位置の探索や DB の待機も中断し、エンコード側の finally で資源を回収する。
                 self._encoding_task.cancel()
                 await asyncio.gather(self._encoding_task, return_exceptions=True)

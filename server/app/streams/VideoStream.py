@@ -396,11 +396,6 @@ class VideoStream:
         await self._video_encoding_task.run(0)
 
 
-    def cancelOfflineEncoding(self) -> None:
-        """RAM 保存を中止し、エンコードを実行中のプロセスに通知する。"""
-        self._video_encoding_task.cancel()
-
-
     @property
     def segment_duration_seconds(self) -> float:
         """フレームレートから算出した通常セグメント長を返す。"""

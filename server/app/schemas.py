@@ -261,8 +261,8 @@ class OfflineVideoSessionStreamMetadata(OfflineVideoSessionInfo):
     next_sequence: int
 
 class OfflineVideoCheckpoint(BaseModel):
-    next_sequence: int = Field(ge=0, le=0xfffffffe, strict=True)
-    connection_id: int = Field(ge=1, le=2**53 - 1, strict=True)
+    next_sequence: Annotated[int, Field(ge=0, le=0xfffffffe, strict=True)]
+    connection_id: Annotated[int, Field(ge=1, le=2**53 - 1, strict=True)]
 
 # ***** シリーズ *****
 

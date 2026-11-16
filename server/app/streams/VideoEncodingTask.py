@@ -1194,80 +1194,88 @@ class VideoEncodingTask:
                     if self._is_cancelled is True:
                         break
 
-                    # RAM 保存では stdout の読み取り待ちだけに期限を設け、容量確保や DB 保存はこの区間の外で行う。
-                    try:
-                        if offline_session is None:
-                            # 通常再生と Background Fetch は、従来どおり前回の読み取り開始からの経過時間で判定する。
-                            current_time = asyncio.get_running_loop().time()
-                            if current_time - last_read_time > read_timeout:
-                                logging.warning(f'{self.video_stream.log_prefix}[Segment {current_sequence}] Encoder output read timeout.')
-                                break
-                            # 同期バイトを探す (通常配信の読み取り手順は変更しない)
-                            isEOF = False
-                            while True:
-                                try:
-                                    if self._encoder_process is None:
-                                        break
-                                    sync_byte = await self._encoder_process.stdout.readexactly(1)
-                                    if sync_byte == ts.SYNC_BYTE:
-                                        break
-                                    elif sync_byte == b'':
-                                        isEOF = True
-                                        break
-                                except asyncio.IncompleteReadError:
-                                    isEOF = True
-                                break
-                            if isEOF:
-                                break
+                    if offline_session is None:
+                        # エンコーダーの出力読み取りタイムアウトをチェック
+                        current_time = asyncio.get_running_loop().time()
+                        if current_time - last_read_time > read_timeout:
+                            logging.warning(f'{self.video_stream.log_prefix}[Segment {current_sequence}] Encoder output read timeout.')
+                            break
 
-                            # TS パケットを読み込む
+                        # 同期バイトを探す
+                        isEOF = False
+                        while True:
+                            try:
+                                # この時点で既にエンコーダープロセスが終了していたら処理中断
+                                if self._encoder_process is None:
+                                    break
+                                sync_byte = await self._encoder_process.stdout.readexactly(1)
+                                if sync_byte == ts.SYNC_BYTE:
+                                    break
+                                elif sync_byte == b'':
+                                    isEOF = True
+                                    break
+                            except asyncio.IncompleteReadError:
+                                isEOF = True
+                            break
+                        if isEOF:
+                            break
+
+                        # TS パケットを読み込む
+                        try:
+                            # この時点で既にエンコーダープロセスが終了していたら処理中断
                             if self._encoder_process is None:
                                 break
                             packet = ts.SYNC_BYTE + await self._encoder_process.stdout.readexactly(ts.PACKET_SIZE - 1)
                             last_read_time = current_time  # 正常に読み取れた場合はタイムアウトをリセット
-                        else:
+                        except asyncio.IncompleteReadError:
+                            break
+
+                        # PID を取得
+                        pid = ts.pid(packet)
+                    else:
+                        # RAM 保存では、容量待ちと DB 保存を除いた stdout の読み取りだけに期限を設ける。
+                        try:
                             async with asyncio.timeout(read_timeout):
                                 packet = await encoder_stdout.readexactly(ts.PACKET_SIZE)
-                    except asyncio.IncompleteReadError as ex:
-                        if offline_session is None or self._is_cancelled:
-                            break
-                        if ex.partial:
-                            raise RuntimeError('Encoder output ended inside a TS packet.') from ex
+                        except asyncio.IncompleteReadError as ex:
+                            if self._is_cancelled:
+                                break
+                            if ex.partial:
+                                raise RuntimeError('Encoder output ended inside a TS packet.') from ex
 
-                        # 公開前に映像・音声の解析が完了しなかった場合だけ、既存の起動リトライへ進む。
-                        if current_sequence == start_sequence and (video_pid is None or audio_pid is None):
-                            should_retry_initial_probe = True
-                            break
+                            # 公開前に映像・音声の解析が完了しなかった場合だけ、既存の起動リトライへ進む。
+                            if current_sequence == start_sequence and (video_pid is None or audio_pid is None):
+                                should_retry_initial_probe = True
+                                break
 
-                        # 下流の stdout が自然 EOF に達した後、すべての入力・変換プロセスの正常終了を確認する。
-                        async with asyncio.timeout(5):
-                            for process in (self._encoder_process, self._tsreadex_process, self._psisimux_process):
-                                if process is not None and await process.wait() != 0:
-                                    raise RuntimeError('An offline encoding process exited with an error.')
-                            if self._tsreadex_feed_task is None or not await asyncio.shield(self._tsreadex_feed_task):
-                                raise RuntimeError('Offline encoding stopped before the end of the input file.')
-                        if self._is_cancelled:
-                            break
+                            # 下流の stdout が自然 EOF に達した後、すべての入力・変換プロセスの正常終了を確認する。
+                            async with asyncio.timeout(5):
+                                for process in (self._encoder_process, self._tsreadex_process, self._psisimux_process):
+                                    if process is not None and await process.wait() != 0:
+                                        raise RuntimeError('An offline encoding process exited with an error.')
+                                if self._tsreadex_feed_task is None or not await asyncio.shield(self._tsreadex_feed_task):
+                                    raise RuntimeError('Offline encoding stopped before the end of the input file.')
+                            if self._is_cancelled:
+                                break
 
-                        # 長さ 0 の映像 PES は次の開始パケットで区切られるため、EOF で最後の一件を取り出す。
-                        if video_parser.pes:
-                            video = video_pes_class(video_parser.pes)
-                            if video.PES_packet_length() != 0:
-                                raise RuntimeError('Encoder output ended inside a video PES.')
-                            video_parser.queue.append(video)
-                            video_parser.pes = None
-                        if audio_parser.pes:
-                            raise RuntimeError('Encoder output ended inside an audio PES.')
-                        is_output_eof = True
-                        packet = b''
-                        pid = video_pid
-                    else:
-                        if offline_session is not None:
+                            # 長さ 0 の映像 PES は次の開始パケットで区切られるため、EOF で最後の一件を取り出す。
+                            if video_parser.pes:
+                                video = video_pes_class(video_parser.pes)
+                                if video.PES_packet_length() != 0:
+                                    raise RuntimeError('Encoder output ended inside a video PES.')
+                                video_parser.queue.append(video)
+                                video_parser.pes = None
+                            if audio_parser.pes:
+                                raise RuntimeError('Encoder output ended inside an audio PES.')
+                            is_output_eof = True
+                            packet = b''
+                            pid = video_pid
+                        else:
                             if packet[:1] != ts.SYNC_BYTE:
                                 raise RuntimeError('Invalid sync byte in offline encoder output.')
                             if ts.transport_error_indicator(packet) or packet[3] & 0x30 == 0:
                                 raise RuntimeError('Invalid TS packet in offline encoder output.')
-                        pid = ts.pid(packet)
+                            pid = ts.pid(packet)
 
                     # PAT (Program Association Table)
                     if not is_output_eof and pid == 0x00:
@@ -1592,12 +1600,18 @@ class VideoEncodingTask:
                 if self._tsreadex_process is not None:
                     # tsreadex が終了すると、フィードは書き込みエラーで抜けて FD を閉じる。
                     if self._tsreadex_feed_task is not None:
+                        feed_task = self._tsreadex_feed_task
+                        # RAM 保存のフィードは期限切れやキャンセル後も最終回収で扱う。
+                        if offline_session is not None:
+                            feed_task = asyncio.shield(feed_task)
                         feed_wait_start_time = time.perf_counter()
                         try:
-                            await asyncio.wait_for(self._tsreadex_feed_task, timeout=3.0)
+                            await asyncio.wait_for(feed_task, timeout=3.0)
                             feed_wait_elapsed_ms = (time.perf_counter() - feed_wait_start_time) * 1000
                             logging.debug(f'{self.video_stream.log_prefix} Feed task completed in {feed_wait_elapsed_ms:.1f}ms.')
-                        except TimeoutError:
+                        except TimeoutError as ex:
+                            if offline_session is not None:
+                                raise RuntimeError('Offline input feed did not stop before encoder retry.') from ex
                             logging.warning(f'{self.video_stream.log_prefix} Feed task did not complete within timeout (3s) after tsreadex kill.')
                         except Exception:
                             pass
@@ -1606,7 +1620,7 @@ class VideoEncodingTask:
                     if offline_session is None:
                         self.__closeTSReadExInputPipe()
                     else:
-                        await asyncio.to_thread(self.__closeTSReadExInputPipe)
+                        await anyio.to_thread.run_sync(self.__closeTSReadExInputPipe)
 
                 # この時点で video_pid と audio_pid が取得できていない場合、正常にエンコード済み TS が出力されていないと考えられるため、
                 # エンコーダー起動をリトライする
@@ -1647,6 +1661,11 @@ class VideoEncodingTask:
                 # 正常に最終セグメントまでエンコードできたか途中でキャンセルされたと考えられるため、リトライループを抜ける
                 break
 
+        except asyncio.CancelledError:
+            # RAM 保存はタスクのキャンセルで中止し、入力フィードの待機を解除するため先に子プロセスを止める。
+            if offline_session is not None:
+                self.cancel()
+            raise
         finally:
             # 起動途中の例外で create_subprocess_exec() 直後の close に到達できなかった、
             # 子プロセスへ渡す側のパイプの読み込み側 FD を回収する
@@ -1754,8 +1773,9 @@ class VideoEncodingTask:
 
             # キャンセルで終わった旧タスクでも、既に読み終えた入力 TS 範囲のキーフレームは次回シークに使える
             ## フィードタスク終了後なら collected_input_key_frames は増えないため、ここで残りをまとめて保存する
-            ## RAM 保存のキャンセルでは、DB の追加更新よりもセッションと実行枠の回収を優先する
-            if offline_session is None or not self._is_cancelled:
+            ## RAM 保存は終了処理に入ってからキャンセルされた場合も、実行枠の回収を優先する
+            encoding_task = asyncio.current_task()
+            if offline_session is None or (encoding_task is not None and encoding_task.cancelling() == 0):
                 await FlushCollectedSegmentMap(is_force = True)
 
             # 参照のクリア (GC を遅らせないため明示的に None を代入)

@@ -20,8 +20,10 @@ import anyio
 import httpx2 as httpx
 import pytest
 from biim.mpeg2ts import ts
+from biim.mpeg2ts.pes import PES
 from starlette.types import Message, Send
 
+from app import schemas
 from app.constants import JST, LIBRARY_PATH, PROCESS_POOL_CONTEXT, QUALITY_TYPES
 from app.metadata.MetadataAnalyzer import MetadataAnalyzer
 from app.models.RecordedProgram import RecordedProgram
@@ -36,24 +38,51 @@ from app.streams.VideoStream import VideoStream
 from tests.conftest import FIXTURES_DIR
 
 
+@pytest.fixture(scope='module')
+def analyzed_recordings() -> dict[Path, schemas.RecordedProgram]:
+    """
+    同じ録画フィクスチャの解析結果をテスト間で再利用する。
+
+    Returns:
+        dict[Path, schemas.RecordedProgram]: 元のファイルパスごとの解析結果
+    """
+    return {}
+
+
 @pytest.fixture(params=['terrestrial-bdav-partial-ts.m2ts'], ids=['M2TS'])
-async def recording(client: httpx.AsyncClient, tmp_path: Path, request: pytest.FixtureRequest) -> AsyncGenerator[tuple[int, Path]]:
+async def recording(
+    client: httpx.AsyncClient,
+    tmp_path: Path,
+    request: pytest.FixtureRequest,
+    analyzed_recordings: dict[Path, schemas.RecordedProgram],
+) -> AsyncGenerator[tuple[int, Path]]:
     """本番の録画スキャンとは独立に、短い録画をテスト用 DB に登録する。"""
     file_name: str = request.param
     source = FIXTURES_DIR / 'recorded' / file_name
+
+    # 本番の録画スキャンと同様に、各フィクスチャを専用プロセスで一度だけ解析する。
+    analyzed = analyzed_recordings.get(source)
+    if analyzed is None:
+        with concurrent.futures.ProcessPoolExecutor(max_workers=1, mp_context=PROCESS_POOL_CONTEXT) as executor:
+            analyzed = await asyncio.get_running_loop().run_in_executor(executor, MetadataAnalyzer(source).analyze)
+        assert analyzed is not None
+        analyzed_recordings[source] = analyzed
+
+    # ファイルを変更するケースでも元のフィクスチャと他のテストを保護するため、コピーを登録する。
     path = tmp_path / source.name
     path.write_bytes(source.read_bytes())
     if path.suffix == '.mp4':
         path.with_suffix('.psc').write_bytes(source.with_suffix('.psc').read_bytes())
     stat = path.stat()
-    # 本番の録画スキャンと同じく、解析側の DB 接続を専用のプロセス内で開いて閉じる。
-    with concurrent.futures.ProcessPoolExecutor(max_workers=1, mp_context=PROCESS_POOL_CONTEXT) as executor:
-        analyzed = await asyncio.get_running_loop().run_in_executor(executor, MetadataAnalyzer(path).analyze)
-    assert analyzed is not None
     program_fields = analyzed.model_dump(exclude={'id', 'channel', 'recorded_video', 'series_id', 'series_broadcast_period_id'})
     program = await RecordedProgram.create(**program_fields)
     video_fields = analyzed.recorded_video.model_dump(exclude={'id', 'recorded_program_id'})
-    video_fields.update(file_size=stat.st_size, file_modified_at=datetime.fromtimestamp(stat.st_mtime, tz=JST))
+    video_fields.update(
+        file_path = str(path),
+        file_size = stat.st_size,
+        file_created_at = datetime.fromtimestamp(stat.st_ctime, tz=JST),
+        file_modified_at = datetime.fromtimestamp(stat.st_mtime, tz=JST),
+    )
     await RecordedVideo.create(recorded_program=program, **video_fields)
     try:
         yield program.id, path
@@ -137,10 +166,10 @@ async def test_offline_video_session_replays_the_same_output(
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize(('quality', 'frame_rate', 'frame_count'), [
-    ('1080p-60fps', 60000, 361),
-    ('720p', 30000, 181),
-    ('540p-24fps', 24000, 145),
+@pytest.mark.parametrize(('quality', 'frame_rate', 'frame_count', 'wrap_dts'), [
+    ('1080p-60fps', 60000, 361, False),
+    ('720p', 30000, 181, True),
+    ('540p-24fps', 24000, 145, False),
 ])
 async def test_offline_video_session_keeps_final_boundary_frame_with_audio(
     client: httpx.AsyncClient,
@@ -149,11 +178,14 @@ async def test_offline_video_session_keeps_final_boundary_frame_with_audio(
     quality: str,
     frame_rate: int,
     frame_count: int,
+    wrap_dts: bool,
 ) -> None:
     """分割境界にある最終フレームを、主音声・副音声と同じ末尾セグメントに保持する。"""
     original_build = VideoEncodingTask.buildFFmpegOptions
 
     def BuildWithFinalKeyFrame(task: VideoEncodingTask, quality: QUALITY_TYPES, output_ts_offset: float) -> list[str]:
+        if wrap_dts:
+            output_ts_offset = (ts.PCR_CYCLE // ts.HZ) - 4
         options = original_build(task, quality, output_ts_offset)
         # 実録画を最後まで読み、6.006 秒の分割境界に最後のキーフレームを配置する。
         options[options.index('-vf') + 1] += f',fps={frame_rate}/1001,trim=end_frame={frame_count},setpts=PTS-STARTPTS'
@@ -162,6 +194,9 @@ async def test_offline_video_session_keeps_final_boundary_frame_with_audio(
             rate_index = options.index('-r')
             del options[rate_index:rate_index + 2]
         options[-1:-1] = ['-sc_threshold', '0', '-force_key_frames', f'expr:eq(n,{frame_count - 1})', '-fps_mode', 'passthrough']
+        if wrap_dts:
+            # B フレームを加え、PTS と別に記録される DTS が 33bit の境界をまたぐ出力を生成する。
+            options[-1:-1] = ['-bf', '2']
         return options
 
     monkeypatch.setattr(VideoEncodingTask, 'buildFFmpegOptions', BuildWithFinalKeyFrame)
@@ -179,15 +214,26 @@ async def test_offline_video_session_keeps_final_boundary_frame_with_audio(
     # FFmpeg の既定 PID ごとに数え、最終フレームと両音声が同じセグメントに含まれることを確かめる。
     packet_counts: Counter[int] = Counter()
     video_frames = 0
+    video_dts: list[int] = []
     for offset in range(0, len(segments[0]), ts.PACKET_SIZE):
         packet = segments[0][offset:offset + ts.PACKET_SIZE]
         pid = ts.pid(packet)
         packet_counts[pid] += 1
         if pid == 0x100 and ts.payload_unit_start_indicator(packet):
             video_frames += 1
+            if wrap_dts:
+                timestamp = PES(ts.payload(packet)).dts()
+                if timestamp is not None:
+                    video_dts.append(timestamp)
     assert video_frames == frame_count
     assert packet_counts[0x101] > 0
     assert packet_counts[0x102] > 0
+    if wrap_dts:
+        assert video_dts[0] > ts.PCR_CYCLE - 10 * ts.HZ
+        assert video_dts[-1] < 10 * ts.HZ
+        metadata_length = struct.unpack_from('>I', response.content, 8)[0]
+        duration_ms = struct.unpack_from('>I', response.content, 16 + metadata_length)[0]
+        assert 6000 <= duration_ms <= 6100
 
 
 @pytest.mark.asyncio
@@ -527,25 +573,20 @@ async def test_offline_video_session_sends_keepalive_during_final_validation(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """終端照合の I/O 待ちにも keepalive を送り、照合後だけ正常終端を公開する。"""
-    loop = asyncio.get_running_loop()
     checking = asyncio.Event()
-    release = threading.Event()
+    release = asyncio.Event()
     keepalive = asyncio.Event()
-    checks = 0
-    original_matches = MetadataAnalyzer.matchesFileHash
     original_stream = OfflineVideoSession.stream
 
-    def CheckWithDelay(analyzer: MetadataAnalyzer, file_hash: str) -> bool:
-        nonlocal checks
-        checks += 1
-        # 初回 GET は通し、正常終端の公開前のファイル照合だけを待たせる。
-        if checks == 2:
-            loop.call_soon_threadsafe(checking.set)
-            if not release.wait(10):
-                raise TimeoutError('Final validation was not released by the test.')
-        return original_matches(analyzer, file_hash)
+    async def CheckWithDelay(_session: OfflineVideoSession) -> bool:
+        checking.set()
+        await asyncio.wait_for(release.wait(), 10)
+        return True
 
     async def TrackStream(session: OfflineVideoSession, connection_id: int, next_sequence: int, send: Send) -> None:
+        # 初回 GET の照合が済んだ時点で、正常終端の公開前の照合に待ち時間を入れる。
+        monkeypatch.setattr(OfflineVideoSession, '_matchesRecording', CheckWithDelay)
+
         async def TrackSend(message: Message) -> None:
             if checking.is_set() and message.get('body') == struct.pack('>II', 0xfffffffe, 0):
                 keepalive.set()
@@ -553,7 +594,6 @@ async def test_offline_video_session_sends_keepalive_during_final_validation(
 
         await original_stream(session, connection_id, next_sequence, TrackSend)
 
-    monkeypatch.setattr(MetadataAnalyzer, 'matchesFileHash', CheckWithDelay)
     monkeypatch.setattr(OfflineVideoSession, 'stream', TrackStream)
     monkeypatch.setattr(OfflineVideoSession, 'KEEPALIVE_INTERVAL', 0.02)
     video_id, _ = recording
@@ -583,29 +623,32 @@ async def test_offline_video_session_legacy_stream(
     recording: tuple[int, Path],
 ) -> None:
     video_id, _ = recording
+    base_url = f'/api/streams/video/{video_id}/240p'
+    # プレイリスト取得前のセグメント要求でセッションが作られ、そこから先頭へシークできることを確認する。
+    params = {'session_id': uuid.uuid4().hex, 'cache_key': 'test'}
+    later_segment = await client.get(f'{base_url}/segment', params={**params, 'sequence': 1})
+    first_segment = await client.get(f'{base_url}/segment', params={**params, 'sequence': 0})
+    for segment in (later_segment, first_segment):
+        assert segment.status_code == 200
+        assert segment.content.startswith(b'\x47') and len(segment.content) % ts.PACKET_SIZE == 0
+    assert later_segment.content != first_segment.content
+
+    # Background Fetch が使う旧形式は、単一リクエストで終端まで取得できる。
     await RecordedVideo.filter(recorded_program_id=video_id).update(duration=1.0)
-    response = await client.get(f'/api/streams/video/{video_id}/240p/offline-stream')
+    response = await client.get(f'{base_url}/offline-stream')
     assert response.status_code == 200
     segments, count = ReadSegments(response.content)
     assert len(segments) == count == 1
 
-    playlist = await client.get(f'/api/streams/video/{video_id}/240p/playlist?session_id={uuid.uuid4().hex}')
-    assert playlist.status_code == 200
-    segment_url = next(line for line in playlist.text.splitlines() if line.startswith('segment?'))
-    segment = await client.get(f'/api/streams/video/{video_id}/240p/{segment_url}')
-    assert segment.status_code == 200
-    assert segment.content.startswith(b'\x47')
-
-
 @pytest.mark.asyncio
-@pytest.mark.parametrize('phase', ['Probe', 'Feed'])
-async def test_offline_video_session_cancel_releases_slot_during_input_read(
+@pytest.mark.parametrize('phase', ['Probe', 'Feed', 'Retry'])
+async def test_offline_video_session_releases_slot_during_input_read(
     client: httpx.AsyncClient,
     recording: tuple[int, Path],
     monkeypatch: pytest.MonkeyPatch,
     phase: str,
 ) -> None:
-    """探索・フィードの read() が止まっていても DELETE と実行枠の返却を完了する。"""
+    """入力が停止していても、キャンセルや起動失敗から実行枠を回収する。"""
     video_id, path = recording
     loop = asyncio.get_running_loop()
     read_started = asyncio.Event()
@@ -627,7 +670,7 @@ async def test_offline_video_session_cancel_releases_slot_during_input_read(
                     is_feed = True
                     break
                 frame = frame.f_back
-            if not self.did_block and is_feed == (phase == 'Feed'):
+            if not self.did_block and is_feed == (phase != 'Probe'):
                 self.did_block = True
                 loop.call_soon_threadsafe(read_started.set)
                 if not release_read.wait(15):
@@ -668,11 +711,21 @@ async def test_offline_video_session_cancel_releases_slot_during_input_read(
     delete_task: asyncio.Task[httpx.Response] | None = None
     try:
         await asyncio.wait_for(read_started.wait(), 5)
-        if phase == 'Feed':
+        if phase != 'Probe':
             await asyncio.wait_for(encoder_started.wait(), 5)
-        delete_task = asyncio.create_task(client.delete(url, headers=headers))
-        assert (await asyncio.wait_for(asyncio.shield(delete_task), 5)).status_code == 204
-        assert OfflineVideoSession.get(session_id, video_id, '240p', created.json()['generation_token']) is None
+        if phase == 'Retry':
+            # 入力のフィードが止まっている間に、映像・音声を出力する前のエンコーダーを終了させる。
+            encoders[0].kill()
+            response = await asyncio.wait_for(asyncio.shield(get_task), 8)
+            assert response.status_code == 200
+            with pytest.raises(struct.error):
+                ReadSegments(response.content)
+            assert len(encoders) == 1
+            assert (await client.get(f'{url}?connection_id=2&next_sequence=0', headers=headers)).status_code == 410
+        else:
+            delete_task = asyncio.create_task(client.delete(url, headers=headers))
+            assert (await asyncio.wait_for(asyncio.shield(delete_task), 5)).status_code == 204
+            assert OfflineVideoSession.get(session_id, video_id, '240p', created.json()['generation_token']) is None
         assert all(encoder.returncode is not None for encoder in encoders)
         # 読み取りの停止を解除する前に、Background Fetch と共有する3枠すべてを取得できる。
         async with asyncio.timeout(1):
@@ -700,24 +753,24 @@ async def test_offline_video_session_put_does_not_read_recording(
     monkeypatch: pytest.MonkeyPatch,
     same_id: bool,
 ) -> None:
-    """同時 PUT は I/O なしで上限と同一 ID を処理し、GET と正常終端だけで照合する。"""
+    """同時 PUT は I/O なしで登録を処理し、ファイルハッシュは初回 GET で照合する。"""
     video_id, _ = recording
     original_hash = MetadataAnalyzer.matchesFileHash
-    identity_checks = 0
+    hash_checks = 0
 
-    def CountIdentityChecks(analyzer: MetadataAnalyzer, file_hash: str) -> bool:
-        nonlocal identity_checks
-        identity_checks += 1
+    def CountHashChecks(analyzer: MetadataAnalyzer, file_hash: str) -> bool:
+        nonlocal hash_checks
+        hash_checks += 1
         return original_hash(analyzer, file_hash)
 
-    monkeypatch.setattr(MetadataAnalyzer, 'matchesFileHash', CountIdentityChecks)
+    monkeypatch.setattr(MetadataAnalyzer, 'matchesFileHash', CountHashChecks)
     first_id = uuid.uuid4().hex
     urls = [
         f'/api/streams/video/{video_id}/240p/offline-sessions/{first_id if same_id else uuid.uuid4().hex}'
         for _ in range(12)
     ]
     responses = await asyncio.gather(*(client.put(url) for url in urls))
-    assert identity_checks == 0
+    assert hash_checks == 0
     assert sorted(response.status_code for response in responses) == ([200] * 11 + [201] if same_id else [201] * 3 + [429] * 9)
     assert len({response.json()['generation_token'] for response in responses if response.status_code != 429}) == (1 if same_id else 3)
 
@@ -727,7 +780,9 @@ async def test_offline_video_session_put_does_not_read_recording(
     assert response.status_code == 200
     segments, count = ReadSegments(response.content)
     assert len(segments) == count >= 1
-    assert identity_checks == 2
+    replay = await client.get(f'{urls[created_index]}?connection_id=2&next_sequence={count}', headers=headers)
+    assert ReadSegments(replay.content) == ([], count)
+    assert hash_checks == 1
 
 
 @pytest.mark.asyncio
