@@ -263,11 +263,24 @@ class OfflineVideoSession:
 
             if self._is_complete:
                 assert sequence == self._produced_next
-                if await self._matchesRecording():
-                    if self._close_task is None and connection_id == self._connection_id:
+                recording_check = asyncio.create_task(self._matchesRecording())
+                try:
+                    # 終端前の DB・ファイル照合が遅くても、受信側の無通信タイムアウトを発生させない。
+                    while True:
+                        done, _ = await asyncio.wait({recording_check}, timeout=keepalive_deadline - loop.time())
+                        if self._close_task is not None or connection_id != self._connection_id:
+                            return
+                        if done:
+                            break
+                        await send({'type': 'http.response.body', 'body': struct.pack('>II', 0xfffffffe, 0), 'more_body': True})
+                        keepalive_deadline = loop.time() + self.KEEPALIVE_INTERVAL
+                    if recording_check.result():
                         await send({'type': 'http.response.body', 'body': struct.pack('>II', 0xffffffff, sequence), 'more_body': True})
-                elif self._close_task is None and connection_id == self._connection_id:
-                    self.close()
+                    else:
+                        self.close()
+                finally:
+                    recording_check.cancel()
+                    await asyncio.gather(recording_check, return_exceptions=True)
                 return
 
             self._changed.clear()
@@ -337,8 +350,8 @@ class OfflineVideoSession:
             before = path.stat()
             if before.st_size != video.file_size:
                 return None
-            if datetime.fromtimestamp(before.st_mtime, tz=video.file_modified_at.tzinfo) != video.file_modified_at:
-                return None
+            # 同じ内容なら録画スキャンは DB の更新日時を更新しない。初回はサイズとハッシュを照合し、
+            # 以後の更新日時の変化はセッションが保持する実ファイルの identity で検出する。
             if not MetadataAnalyzer(path).matchesFileHash(video.file_hash):
                 return None
             after = path.stat()

@@ -14,6 +14,7 @@ from collections import deque
 from collections.abc import Callable
 from typing import TYPE_CHECKING, BinaryIO, ClassVar, Literal, cast
 
+import anyio
 from biim.mpeg2ts import ts
 from biim.mpeg2ts.h264 import H264PES
 from biim.mpeg2ts.h265 import H265PES
@@ -1043,7 +1044,7 @@ class VideoEncodingTask:
                                 tsreadex_stdin_write_generation_token = self.__registerTSReadExInputPipe(tsreadex_stdin_write)
                             else:
                                 # RAM 保存では登録中のキャンセルでも、書き込み側の所有権を確定してから終了処理へ渡す。
-                                register_pipe_task = asyncio.create_task(asyncio.to_thread(
+                                register_pipe_task = asyncio.create_task(anyio.to_thread.run_sync(
                                     self.__registerTSReadExInputPipe, tsreadex_stdin_write,
                                 ))
                                 try:
@@ -1742,7 +1743,8 @@ class VideoEncodingTask:
             if offline_session is None:
                 self.__closeTSReadExInputPipe()
             else:
-                await asyncio.to_thread(self.__closeTSReadExInputPipe)
+                # 入力 I/O で asyncio の既定プールが埋まっていても、回収と実行枠の返却を進める。
+                await anyio.to_thread.run_sync(self.__closeTSReadExInputPipe)
 
             # 通常配信の録画ファイルを閉じる (RAM 保存ではワーカーが所有する)
             ## 通常配信は従来どおりフィードの終了待ちの後で閉じる。

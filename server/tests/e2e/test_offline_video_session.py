@@ -16,10 +16,11 @@ from pathlib import Path
 from types import FunctionType
 from typing import Any
 
+import anyio
 import httpx2 as httpx
 import pytest
 from biim.mpeg2ts import ts
-from starlette.types import Message
+from starlette.types import Message, Send
 
 from app.constants import JST, LIBRARY_PATH, PROCESS_POOL_CONTEXT, QUALITY_TYPES
 from app.metadata.MetadataAnalyzer import MetadataAnalyzer
@@ -408,7 +409,7 @@ async def test_offline_video_session_cancels_pending_encoding(
     original_resolve = VideoStream.resolveSegmentSourcePosition
     original_wait = OfflineVideoSession.waitForCapacity
     original_save = VideoStream.saveSegmentMapEntries
-    original_to_thread = asyncio.to_thread
+    original_to_thread = anyio.to_thread.run_sync
     original_pipe = os.pipe
     pipe_fds: list[int] = []
 
@@ -462,7 +463,7 @@ async def test_offline_video_session_cancels_pending_encoding(
         monkeypatch.setattr(VideoStream, 'saveSegmentMapEntries', SaveWithDelay)
     else:
         monkeypatch.setattr(os, 'pipe', TrackPipe)
-        monkeypatch.setattr(asyncio, 'to_thread', DelayPipeRegistration)
+        monkeypatch.setattr(anyio.to_thread, 'run_sync', DelayPipeRegistration)
     video_id, _ = recording
     url = f'/api/streams/video/{video_id}/240p/offline-sessions/{uuid.uuid4().hex}'
     created = await client.put(url)
@@ -490,6 +491,87 @@ async def test_offline_video_session_cancels_pending_encoding(
             assert encoder_process.returncode is not None
     finally:
         # 修正前のコードで失敗した場合も、待機を解除してテスト用の資源を回収する。
+        release.set()
+        await client.delete(url, headers=headers)
+        await response_task
+
+
+@pytest.mark.asyncio
+async def test_offline_video_session_accepts_stale_database_mtime(
+    client: httpx.AsyncClient,
+    recording: tuple[int, Path],
+) -> None:
+    """保存前の日時だけの差は許容し、保存開始後の実ファイルの変更は拒否する。"""
+    video_id, path = recording
+    stat = path.stat()
+    os.utime(path, ns=(stat.st_atime_ns, stat.st_mtime_ns + 5_000_000_000))
+    url = f'/api/streams/video/{video_id}/240p/offline-sessions/{uuid.uuid4().hex}'
+    created = await client.put(url)
+    assert created.status_code == 201
+    headers = {'X-KonomiTV-Offline-Generation': created.json()['generation_token']}
+    response = await client.get(f'{url}?connection_id=1&next_sequence=0', headers=headers)
+    assert response.status_code == 200
+    segments, count = ReadSegments(response.content)
+    assert len(segments) == count > 0
+
+    os.utime(path, ns=(stat.st_atime_ns, stat.st_mtime_ns + 10_000_000_000))
+    response = await client.get(f'{url}?connection_id=2&next_sequence=0', headers=headers)
+    assert response.status_code == 409
+    assert response.json()['detail']['code'] == 'recording_changed'
+
+
+@pytest.mark.asyncio
+async def test_offline_video_session_sends_keepalive_during_final_validation(
+    client: httpx.AsyncClient,
+    recording: tuple[int, Path],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """終端照合の I/O 待ちにも keepalive を送り、照合後だけ正常終端を公開する。"""
+    loop = asyncio.get_running_loop()
+    checking = asyncio.Event()
+    release = threading.Event()
+    keepalive = asyncio.Event()
+    checks = 0
+    original_matches = MetadataAnalyzer.matchesFileHash
+    original_stream = OfflineVideoSession.stream
+
+    def CheckWithDelay(analyzer: MetadataAnalyzer, file_hash: str) -> bool:
+        nonlocal checks
+        checks += 1
+        # 初回 GET は通し、正常終端の公開前のファイル照合だけを待たせる。
+        if checks == 2:
+            loop.call_soon_threadsafe(checking.set)
+            if not release.wait(10):
+                raise TimeoutError('Final validation was not released by the test.')
+        return original_matches(analyzer, file_hash)
+
+    async def TrackStream(session: OfflineVideoSession, connection_id: int, next_sequence: int, send: Send) -> None:
+        async def TrackSend(message: Message) -> None:
+            if checking.is_set() and message.get('body') == struct.pack('>II', 0xfffffffe, 0):
+                keepalive.set()
+            await send(message)
+
+        await original_stream(session, connection_id, next_sequence, TrackSend)
+
+    monkeypatch.setattr(MetadataAnalyzer, 'matchesFileHash', CheckWithDelay)
+    monkeypatch.setattr(OfflineVideoSession, 'stream', TrackStream)
+    monkeypatch.setattr(OfflineVideoSession, 'KEEPALIVE_INTERVAL', 0.02)
+    video_id, _ = recording
+    url = f'/api/streams/video/{video_id}/240p/offline-sessions/{uuid.uuid4().hex}'
+    created = await client.put(url)
+    assert created.status_code == 201
+    headers = {'X-KonomiTV-Offline-Generation': created.json()['generation_token']}
+    response_task = asyncio.create_task(client.get(f'{url}?connection_id=1&next_sequence=0', headers=headers))
+    try:
+        await asyncio.wait_for(checking.wait(), 10)
+        await asyncio.wait_for(keepalive.wait(), 1)
+        assert not response_task.done()
+        release.set()
+        response = await asyncio.wait_for(response_task, 5)
+        assert response.status_code == 200
+        segments, count = ReadSegments(response.content)
+        assert len(segments) == count > 0
+    finally:
         release.set()
         await client.delete(url, headers=headers)
         await response_task
@@ -569,6 +651,14 @@ async def test_offline_video_session_cancel_releases_slot_during_input_read(
 
     monkeypatch.setattr(sys.modules[VideoEncodingTask.__module__], 'open', OpenInput, raising=False)
     monkeypatch.setattr(OfflineVideoSession, 'waitForCapacity', TrackEncoder)
+    # 入力 read() 一つで既定プールを満杯にし、回収が同じプールの空きを待たないことを確認する。
+    input_executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+    original_run = loop.run_in_executor
+
+    def RunWithLimitedInputPool(executor: concurrent.futures.Executor | None, func: Callable[..., Any], *args: Any) -> asyncio.Future[Any]:
+        return original_run(input_executor if executor is None else executor, func, *args)
+
+    monkeypatch.setattr(loop, 'run_in_executor', RunWithLimitedInputPool)
     session_id = uuid.uuid4().hex
     url = f'/api/streams/video/{video_id}/240p/offline-sessions/{session_id}'
     created = await client.put(url)
@@ -598,6 +688,8 @@ async def test_offline_video_session_cancel_releases_slot_during_input_read(
         await asyncio.wait_for(get_task, 10)
         if read_started.is_set():
             await asyncio.wait_for(file_closed.wait(), 5)
+        monkeypatch.setattr(loop, 'run_in_executor', original_run)
+        input_executor.shutdown(wait=True)
 
 
 @pytest.mark.asyncio
