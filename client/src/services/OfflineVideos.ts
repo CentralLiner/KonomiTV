@@ -1400,14 +1400,6 @@ export default class OfflineVideos {
     }
 
     /**
-     * 保存済み動画を端末から削除する。
-     * @param video 削除操作で選択された保存済み動画
-     */
-    static async deleteVideo(video: IOfflineVideo): Promise<void> {
-        await OfflineVideoStorage.deleteVideo(video);
-    }
-
-    /**
      * 保存済み動画の HLS プレイリスト URLを返す。
      * @param video 保存済み動画
      * @returns Service Worker が配信するプレイリスト URL

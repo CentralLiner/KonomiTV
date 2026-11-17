@@ -2,8 +2,8 @@
     <component :is="hasOfflineJobActions ? 'div' : programTag" v-ripple class="recorded-program"
         v-bind="hasOfflineJobActions ? {} : programLinkProps"
         :class="{
-            'recorded-program--recording': program.recorded_video.status === 'Recording',
-            'recorded-program--failed': program.recorded_video.status === 'AnalysisFailed',
+            'recorded-program--recording': !hasSavedOfflineVideo && program.recorded_video.status === 'Recording',
+            'recorded-program--failed': !hasSavedOfflineVideo && program.recorded_video.status === 'AnalysisFailed',
             'recorded-program--offline': forOffline,
             'recorded-program--offline-blocked': isOfflineInteractionBlocked,
             'recorded-program--offline-job-failed': isOfflineJobFailed,
@@ -294,6 +294,7 @@ import OfflineVideoDownloadDialog from '@/components/Videos/Dialogs/OfflineVideo
 import RecordedFileInfoDialog from '@/components/Videos/Dialogs/RecordedFileInfoDialog.vue';
 import Message from '@/message';
 import OfflineVideos, { type IOfflineDownloadJob, type IOfflineVideo } from '@/services/OfflineVideos';
+import OfflineVideoStorage from '@/services/OfflineVideoStorage';
 import Videos, { type IRecordedProgram } from '@/services/Videos';
 import useSettingsStore from '@/stores/SettingsStore';
 import useUserStore from '@/stores/UserStore';
@@ -436,10 +437,13 @@ const isOfflineJobFailed = computed(() => props.offlineDownloadJob?.state === 'F
 // 再試行・削除の操作がある行では、再生リンクを番組の行だけに付ける
 const hasOfflineJobActions = computed(() => props.forOffline && isOfflineJobFailed.value);
 
+// 再保存の状態とは独立に、端末に残っている保存済み動画を再生できる。
+const hasSavedOfflineVideo = computed(() => props.forOffline && props.offlineVideo !== null);
+
 // 保存済みデータがなく、保存ジョブだけが存在する場合は再生リンクを無効化する
 const isOfflineInteractionBlocked = computed(() => {
     if (props.forOffline !== true) return false;
-    if (props.offlineVideo !== null) return false;
+    if (hasSavedOfflineVideo.value) return false;
     return isOfflineJobActive.value === true || isOfflineJobFailed.value === true;
 });
 
@@ -449,7 +453,7 @@ const programTag = computed(() => isOfflineInteractionBlocked.value === true ? '
 const programLinkProps = computed(() => {
     if (programTag.value !== 'router-link') return {};
     return {
-        to: props.program.recorded_video.status === 'Recorded'
+        to: hasSavedOfflineVideo.value || props.program.recorded_video.status === 'Recorded'
             ? (props.forOffline ? `/videos/watch/${props.program.id}?source=offline` : `/videos/watch/${props.program.id}`)
             : { path: '' },
     };
@@ -564,7 +568,7 @@ const confirmDeleteOfflineVideo = async (): Promise<void> => {
     if (video === null || isDeletingOfflineVideo.value === true) return;
     isDeletingOfflineVideo.value = true;
     try {
-        await OfflineVideos.deleteVideo(video);
+        await OfflineVideoStorage.deleteVideo(video);
     } catch (error) {
         Message.error(error instanceof Error ? error.message : 'オフライン保存を削除できませんでした。');
         return;
