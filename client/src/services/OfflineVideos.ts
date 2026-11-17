@@ -384,14 +384,15 @@ export default class OfflineVideos {
     }
 
     /** 失敗したジョブを同じ画質と保存方式で先頭からやり直す。 */
-    static async retry(jobID: string): Promise<IOfflineDownloadJob> {
+    static async retry(jobID: string): Promise<IOfflineDownloadJob | null> {
         const failedJob = await OfflineVideoStorage.getJob(jobID);
         if (failedJob?.state !== 'Failed') {
             throw new Error('やり直す保存が見つかりませんでした。');
         }
         const program = await Videos.fetchVideo(failedJob.video_id);
         if (program === null) {
-            throw new Error('録画番組の情報を取得できませんでした。');
+            // 番組の取得エラーの表示は、ほかの録画画面と同じく Videos に任せる。
+            return null;
         }
 
         // DB 再構築で同じ ID に別の録画が割り当てられることがある。差し替え前後の録画は放送回で照合する。
@@ -448,8 +449,7 @@ export default class OfflineVideos {
                     await cache.put(destination, response);
                 } catch (error) {
                     assetSignal.throwIfAborted();
-                    const isStorageError = error instanceof DOMException &&
-                        ['QuotaExceededError', 'NetworkError', 'UnknownError', 'AbortError'].includes(error.name);
+                    const isStorageError = error instanceof DOMException;
                     // 未使用の本文を読み始めた後の TypeError は、本文の通信・デコード失敗として扱う。
                     const isBodyReadError = error instanceof TypeError && hasUnreadBody && response.bodyUsed;
                     if (!isStorageError && !isBodyReadError) throw error;
@@ -1436,19 +1436,20 @@ export default class OfflineVideos {
         if ('RTCPeerConnection' in window === false) return null;
         signal.throwIfAborted();
 
-        const offerPeerConnection = new RTCPeerConnection({iceServers: []});
-        const answerPeerConnection = new RTCPeerConnection({iceServers: []});
-        const offerDataChannel = offerPeerConnection.createDataChannel('konomitv-offline-download');
-        const dataChannels = [offerDataChannel];
+        const peerConnections: RTCPeerConnection[] = [];
+        const dataChannels: RTCDataChannel[] = [];
         const closeConnections = () => {
             dataChannels.forEach(dataChannel => dataChannel.close());
-            offerPeerConnection.close();
-            answerPeerConnection.close();
+            peerConnections.forEach(peerConnection => peerConnection.close());
         };
 
         const {controller, dispose} = this.linkAbortController(signal);
         const preparationSignal = controller.signal;
         let preparationTimeout: ReturnType<typeof setTimeout> | undefined;
+        // ICE と DataChannel の待機に加え、ブラウザの Offer / Answer 操作にも準備全体の期限を設ける。
+        const setupTimeout = setTimeout(() => {
+            controller.abort(new Error('WebRTC のローカル接続準備がタイムアウトしました。'));
+        }, 20_000);
 
         const waitUntilReady = async (target: EventTarget, event: string, isReady: () => boolean): Promise<void> => {
             preparationSignal.throwIfAborted();
@@ -1470,6 +1471,12 @@ export default class OfflineVideos {
         };
 
         const connect = async (): Promise<void> => {
+            const offerPeerConnection = new RTCPeerConnection({iceServers: []});
+            peerConnections.push(offerPeerConnection);
+            const answerPeerConnection = new RTCPeerConnection({iceServers: []});
+            peerConnections.push(answerPeerConnection);
+            const offerDataChannel = offerPeerConnection.createDataChannel('konomitv-offline-download');
+            dataChannels.push(offerDataChannel);
             answerPeerConnection.addEventListener('datachannel', (event) => {
                 dataChannels.push(event.channel);
             }, {once: true, signal: preparationSignal});
@@ -1508,6 +1515,7 @@ export default class OfflineVideos {
             throw error;
         } finally {
             clearTimeout(preparationTimeout);
+            clearTimeout(setupTimeout);
             dispose();
             controller.abort();
         }
