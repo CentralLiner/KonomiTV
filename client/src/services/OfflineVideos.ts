@@ -400,17 +400,20 @@ export default class OfflineVideos {
         }
 
         // DB 再構築で同じ ID に別の録画が割り当てられることがある。差し替え前後の録画は放送回で照合する。
-        const previousProgram = failedJob.program;
-        const previousFileHash = previousProgram.recorded_video.file_hash;
-        const isSameFile = Boolean(previousFileHash) && program.recorded_video.file_hash === previousFileHash;
-        const isSameBroadcast = typeof previousProgram.network_id === 'number' && program.network_id === previousProgram.network_id &&
-            typeof previousProgram.service_id === 'number' && program.service_id === previousProgram.service_id &&
-            typeof previousProgram.event_id === 'number' && program.event_id === previousProgram.event_id &&
-            typeof previousProgram.start_time === 'string' && program.start_time === previousProgram.start_time;
-        if (!isSameFile && !isSameBroadcast) {
+        if (!this.isSameRecording(program, failedJob.program)) {
             throw new Error('同じ録画番組か確認できませんでした。録画番組の画面から保存を開始してください。');
         }
         return await this.start(program, failedJob.quality, failedJob.background_fetch_id !== null, jobID);
+    }
+
+    /** ファイルハッシュまたは放送回の情報で、同じ録画番組かを照合する。 */
+    static isSameRecording(program: IRecordedProgram, previousProgram: IRecordedProgram): boolean {
+        const previousFileHash = previousProgram.recorded_video.file_hash;
+        if (previousFileHash && program.recorded_video.file_hash === previousFileHash) return true;
+        return typeof previousProgram.network_id === 'number' && program.network_id === previousProgram.network_id &&
+            typeof previousProgram.service_id === 'number' && program.service_id === previousProgram.service_id &&
+            typeof previousProgram.event_id === 'number' && program.event_id === previousProgram.event_id &&
+            typeof previousProgram.start_time === 'string' && program.start_time === previousProgram.start_time;
     }
 
     private static async prepareAssets(job: IOfflineDownloadJob, signal: AbortSignal): Promise<void> {

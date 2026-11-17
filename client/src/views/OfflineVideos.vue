@@ -87,17 +87,18 @@ const savedSizeBytes = computed(() => videos.value.reduce((total, video) => tota
 /** 保存済み動画と保存ジョブを1つの一覧へ統合する */
 const displayPrograms = computed((): IRecordedProgram[] => {
     const programs: IRecordedProgram[] = [];
-    const seenVideoIDs = new Set<number>();
+    const jobsByVideoID = new Map<number, IOfflineDownloadJob>();
 
     // 実行中・失敗のジョブを先頭へ並べ、同じ番組の二重表示を防ぐ
     for (const job of visibleOfflineJobs.value) {
-        if (seenVideoIDs.has(job.video_id) === true) continue;
-        seenVideoIDs.add(job.video_id);
+        if (jobsByVideoID.has(job.video_id)) continue;
+        jobsByVideoID.set(job.video_id, job);
         programs.push(job.program);
     }
     for (const video of videos.value) {
-        if (seenVideoIDs.has(video.video_id) === true) continue;
-        seenVideoIDs.add(video.video_id);
+        // 録画 ID が別の番組に再利用された場合は、保存済み動画を独立した行から再生できるようにする。
+        const job = jobsByVideoID.get(video.video_id);
+        if (job !== undefined && OfflineVideos.isSameRecording(video.program, job.program)) continue;
         programs.push(video.program);
     }
     return programs;
@@ -237,10 +238,10 @@ const retryJob = async (jobID: string): Promise<void> => {
     }
 };
 
-// 保存処理のイベントに加え、Background Fetch の進捗も画面表示中だけ定期的に読み直す
+// 保存処理のイベントに加え、実行中のジョブの進捗を画面表示中だけ定期的に読み直す
 let refreshTimerID: number | null = null;
 watch(() => activeJobs.value.length > 0, (hasActiveJobs) => {
-    // Background Fetch 進捗だけを1秒おきに反映し、IndexedDB 全読み直しによる UI の巻き戻りを避ける
+    // 一覧を作り直さず、実行中ジョブの表示を1秒おきに更新する。
     if (hasActiveJobs === true && refreshTimerID === null) {
         refreshTimerID = window.setInterval(refreshActiveJobProgress, 1000);
     } else if (hasActiveJobs === false && refreshTimerID !== null) {

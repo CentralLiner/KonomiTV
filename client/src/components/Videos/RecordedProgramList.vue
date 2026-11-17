@@ -67,10 +67,10 @@
                 </div>
             </div>
             <div class="recorded-program-list__grid-content">
-                <RecordedProgram v-for="{program, job} in displayProgramEntries" :key="program.id" :program="program"
+                <RecordedProgram v-for="{program, job, video} in displayProgramEntries"
+                    :key="job?.job_id ?? video?.generation_id ?? program.id" :program="program"
                     :forMylist="forMylist" :forWatchedHistory="forWatchedHistory" :forOffline="forOffline"
-                    :offlineVideo="offlineVideos?.find(video => video.video_id === program.id) ?? null"
-                    :offlineDownloadJob="job"
+                    :offlineVideo="video" :offlineDownloadJob="job"
                     :isOfflineJobReconnecting="job !== null && reconnectingOfflineJobIDs?.has(job.job_id)"
                     :isRetryingOfflineJob="job !== null && retryingOfflineJobIDs?.has(job.job_id)"
                     @deleted="handleProgramDeleted"
@@ -96,9 +96,8 @@
 import { computed, ref, watch } from 'vue';
 import { useRouter } from 'vue-router';
 
-import type { IOfflineDownloadJob, IOfflineVideo } from '@/services/OfflineVideos';
-
 import RecordedProgram from '@/components/Videos/RecordedProgram.vue';
+import OfflineVideos, { type IOfflineDownloadJob, type IOfflineVideo } from '@/services/OfflineVideos';
 import { type IRecordedProgram, MylistSortOrder, SortOrder } from '@/services/Videos';
 import Utils from '@/utils';
 
@@ -200,15 +199,18 @@ const handleProgramDeleted = (id: number) => {
 };
 
 /** 一覧に表示する保存ジョブを取得する */
-const getOfflineDownloadJob = (videoID: number): IOfflineDownloadJob | null => {
+const getOfflineDownloadJob = (program: IRecordedProgram): IOfflineDownloadJob | null => {
     return props.offlineJobs?.find(job =>
-        job.video_id === videoID && ['Waiting', 'Downloading', 'Finalizing', 'Failed'].includes(job.state),
+        job.video_id === program.id && (job.program === program || OfflineVideos.isSameRecording(job.program, program)),
     ) ?? null;
 };
 
 const displayProgramEntries = computed(() => displayPrograms.value.map(program => ({
     program,
-    job: getOfflineDownloadJob(program.id),
+    job: getOfflineDownloadJob(program),
+    video: props.offlineVideos?.find(video =>
+        video.video_id === program.id && (video.program === program || OfflineVideos.isSameRecording(video.program, program)),
+    ) ?? null,
 })));
 
 </script>
