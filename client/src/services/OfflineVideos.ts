@@ -441,23 +441,18 @@ export default class OfflineVideos {
             if (response === null) return;
 
             try {
-                // エラーレスポンスと CacheStorage に保存できない HTTP レスポンスは、画像の取得失敗として扱う。
-                const vary = response.headers.get('Vary');
-                if (!response.ok || response.status === 206 || vary?.split(',').some(value => value.trim() === '*')) {
-                    console.warn('[OfflineVideos] Optional offline asset returned an uncacheable response.', response.status);
+                if (!response.ok) {
+                    console.warn('[OfflineVideos] Failed to download an optional offline asset. HTTP', response.status);
                     return;
                 }
 
                 // cache.put() が本文を読み切るまで、ジョブのキャンセルを Fetch に伝える。
-                const hasUnreadBody = !response.bodyUsed && response.body?.locked !== true;
                 try {
                     await cache.put(destination, response);
                 } catch (error) {
                     assetSignal.throwIfAborted();
-                    const isStorageError = error instanceof DOMException;
-                    // 未使用の本文を読み始めた後の TypeError は、本文の通信・デコード失敗として扱う。
-                    const isBodyReadError = error instanceof TypeError && hasUnreadBody && response.bodyUsed;
-                    if (!isStorageError && !isBodyReadError) throw error;
+                    // 206 や Vary: * など、CacheStorage が受け付けない画像レスポンスもここで扱う。
+                    if (!(error instanceof DOMException || error instanceof TypeError)) throw error;
                     console.warn('[OfflineVideos] Failed to cache an optional offline asset:', error);
                 }
             } finally {
