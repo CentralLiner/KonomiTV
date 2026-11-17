@@ -624,7 +624,7 @@ class OfflineVideoSession:
             # 同じ内容なら録画スキャンは DB の更新日時を更新しない。初回はサイズとハッシュを照合し、
             # 以後の更新日時の変化はセッションが保持する実ファイルの identity で検出する。
             if verify_hash:
-                if not MetadataAnalyzer(path).matchesFileHash(video.file_hash):
+                if not MetadataAnalyzer(path).matchesFileHash(video.file_hash, raise_on_error=True):
                     return None
                 # 読み取ったハッシュと記録する識別情報を同じファイルのものにそろえる。
                 after = path.stat()

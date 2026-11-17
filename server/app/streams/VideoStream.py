@@ -191,7 +191,6 @@ class VideoStream:
                 cls.__instances[session_id] = instance
 
             logging.info(f'{instance.log_prefix} Streaming Session Started.')
-            return instance
 
         else:
             # 既存のインスタンスを取得
@@ -223,8 +222,7 @@ class VideoStream:
                     detail = 'Session exists but encoding options mismatch',
                 )
 
-        # 登録されているインスタンスを返す
-        return cls.__instances[session_id]
+        return instance
 
 
     def __init__(

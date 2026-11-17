@@ -517,8 +517,8 @@ class VideoEncodingTask:
         # 切り出した HLS セグメント用 MPEG-TS パケットを一時的に保持するバッファ
         encoded_segment = bytearray()
         append_packet: Callable[[bytes], None] = encoded_segment.extend
-        if offline_session is not None:
-            max_segment_bytes = offline_session.MAX_SEGMENT_BYTES
+        max_segment_bytes = offline_session.MAX_SEGMENT_BYTES if offline_session is not None else None
+        if max_segment_bytes is not None:
 
             def AppendOfflinePacket(packet: bytes) -> None:
                 """
@@ -535,6 +535,49 @@ class VideoEncodingTask:
                 encoded_segment.extend(packet)
 
             append_packet = AppendOfflinePacket
+
+        def PushPES(parser: PESParser[PES], packet: bytes) -> None:
+            """
+            TS パケットから PES を組み立て、RAM 保存では異常な途中終了・肥大化を検出する。
+
+            Args:
+                parser (PESParser[PES]): 映像または音声の PES パーサー
+                packet (bytes): パーサーに渡す TS パケット
+
+            Returns:
+                None
+            """
+            if max_segment_bytes is not None and parser.pes and ts.payload_unit_start_indicator(packet):
+                # biim は長さが指定された未完の PES を次の開始パケットで暗黙に破棄する。
+                if parser.pes[4] != 0 or parser.pes[5] != 0:
+                    raise RuntimeError('A new PES started before the previous PES was complete.')
+            parser.push(packet)
+            if max_segment_bytes is not None and parser.pes is not None and len(parser.pes) > max_segment_bytes:
+                # 長さ 0 の映像 PES は次の開始パケットまで伸びるため、追加の TS パケットが来るたびに確認する。
+                raise RuntimeError('Offline PES exceeded the maximum segment size.')
+
+        def AppendPES(pes: PES, pid: int, continuity_counter: int) -> int:
+            """
+            PES をセグメントに追加し、次の TS パケットの連続性カウンターを返す。
+
+            Args:
+                pes (PES): セグメントに追加する映像または音声 PES
+                pid (int): パケットに設定する PID
+                continuity_counter (int): 最初のパケットの連続性カウンター
+
+            Returns:
+                int: 次のパケットの連続性カウンター
+            """
+            if max_segment_bytes is not None:
+                # packetize_pes() が TS パケットを一括生成する前に、現在のセグメントに収まるか確認する。
+                payload_size = ts.PACKET_SIZE - ts.HEADER_SIZE
+                packet_count = (len(pes) + payload_size - 1) // payload_size
+                if len(encoded_segment) + packet_count * ts.PACKET_SIZE > max_segment_bytes:
+                    raise RuntimeError('Offline segment exceeded the maximum size.')
+            for packet in packetize_pes(pes, False, False, pid, 0, continuity_counter):
+                append_packet(packet)
+                continuity_counter = (continuity_counter + 1) & 0x0F
+            return continuity_counter
 
         # 例外経路で未回収の raw pipe FD が残らないように、現在の反復で確保した read 側 FD を保持する
         ## 通常経路では create_subprocess_exec() の直後に close されるが、起動失敗時は finally 句まで到達しないため
@@ -1484,7 +1527,7 @@ class VideoEncodingTask:
                     # 映像ストリーム
                     elif pid == video_pid:
                         if not is_output_eof and (offline_session is None or ts.has_payload(packet)):
-                            video_parser.push(packet)
+                            PushPES(video_parser, packet)
                         for video in video_parser:
                             # 現在の PES の 33bit タイムスタンプ (DTS 優先, 90kHz)
                             dts_value = video.dts()
@@ -1641,20 +1684,16 @@ class VideoEncodingTask:
                                             pmt_cc = (pmt_cc + 1) & 0x0F
 
                             # 現在の映像 PES をパケット化して、現在処理対象のセグメントに追加
-                            for packet in packetize_pes(video, False, False, cast(int, video_pid), 0, video_cc):
-                                append_packet(packet)
-                                video_cc = (video_cc + 1) & 0x0F
+                            video_cc = AppendPES(video, cast(int, video_pid), video_cc)
                             offline_segment_has_video = True
 
                     # 音声ストリーム
                     elif pid == audio_pid:
                         if offline_session is None or ts.has_payload(packet):
-                            audio_parser.push(packet)
+                            PushPES(audio_parser, packet)
                         for audio in audio_parser:
                             # PES パケットを再構築して candidate に追加
-                            for packet in packetize_pes(audio, False, False, cast(int, audio_pid), 0, audio_cc):
-                                append_packet(packet)
-                                audio_cc = (audio_cc + 1) & 0x0F
+                            audio_cc = AppendPES(audio, cast(int, audio_pid), audio_cc)
 
                     # その他のパケット
                     else:

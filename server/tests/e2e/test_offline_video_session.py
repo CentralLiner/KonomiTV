@@ -20,6 +20,7 @@ import anyio
 import httpx2 as httpx
 import pytest
 from biim.mpeg2ts import ts
+from biim.mpeg2ts.parser import PESParser
 from biim.mpeg2ts.pes import PES
 from starlette.types import Message, Send
 
@@ -192,6 +193,11 @@ async def test_offline_video_session_revalidates_recording_on_reconnect(
         None
     """
     video_id, path = recording
+    # ゼロ埋めされた録画では、末尾の余白を除いた範囲が登録済みのハッシュと一致する。
+    with path.open('r+b') as file:
+        padded_size = path.stat().st_size + 1024 * 1024
+        file.truncate(padded_size)
+    await RecordedVideo.filter(recorded_program_id=video_id).update(file_size=padded_size)
     # DB に登録済みの録画と同じ内容なら、保存開始前の更新日時の差を許容する。
     stat = path.stat()
     os.utime(path, ns=(stat.st_atime_ns, stat.st_mtime_ns + 5_000_000_000))
@@ -199,13 +205,9 @@ async def test_offline_video_session_revalidates_recording_on_reconnect(
     created = await client.put(url)
     assert created.status_code == 201
     headers = {'X-KonomiTV-Offline-Generation': created.json()['generation_token']}
-    response = await client.get(f'{url}?connection_id=1&next_sequence=0', headers=headers)
-    assert response.status_code == 200
-    segments, count = ReadSegments(response.content)
-    assert len(segments) == count > 1
-
     original_stat = Path.stat
-    calls_until_failure = 1
+    # ファイルサイズの照合と全体のハッシュ計算の後、ゼロ埋め境界の探索で I/O が失敗する。
+    calls_until_failure = 3
 
     def StatWithTemporaryFailure(target: Path, *, follow_symlinks: bool = True) -> os.stat_result:
         nonlocal calls_until_failure
@@ -216,7 +218,15 @@ async def test_offline_video_session_revalidates_recording_on_reconnect(
         return original_stat(target, follow_symlinks=follow_symlinks)
 
     monkeypatch.setattr(Path, 'stat', StatWithTemporaryFailure)
+    interrupted_hash_check = await client.get(f'{url}?connection_id=1&next_sequence=0', headers=headers)
+    assert interrupted_hash_check.status_code == 503
+    response = await client.get(f'{url}?connection_id=1&next_sequence=0', headers=headers)
+    assert response.status_code == 200
+    segments, count = ReadSegments(response.content)
+    assert len(segments) == count > 1
+
     # 再接続時の照合で一度失敗しても、次の GET で既存のデータを取り直せる。
+    calls_until_failure = 1
     retry = await client.get(f'{url}?connection_id=2&next_sequence=1', headers=headers)
     assert retry.status_code == 503
     replay = await client.get(f'{url}?connection_id=3&next_sequence=1', headers=headers)
@@ -255,9 +265,9 @@ async def test_offline_video_session_cancels_gets_waiting_for_recording_check(
     release = threading.Event()
     original_matches = MetadataAnalyzer.matchesFileHash
 
-    def MatchWithStalledRead(analyzer: MetadataAnalyzer, file_hash: str) -> bool:
+    def MatchWithStalledRead(analyzer: MetadataAnalyzer, file_hash: str, *, raise_on_error: bool = False) -> bool:
         # NAS が一時的に応答しない状況を、録画ハッシュの読み取りで再現する。
-        matches = original_matches(analyzer, file_hash)
+        matches = original_matches(analyzer, file_hash, raise_on_error=raise_on_error)
         loop.call_soon_threadsafe(started.put_nowait, None)
         assert release.wait(10)
         return matches
@@ -1058,6 +1068,8 @@ async def test_offline_video_session_cancels_encoder_retry(
 @pytest.mark.asyncio
 @pytest.mark.parametrize(('failure', 'recording'), [
     ('PartialPacket', 'terrestrial-bdav-partial-ts.m2ts'),
+    ('IncompletePES', 'terrestrial-bdav-partial-ts.m2ts'),
+    ('OversizedPES', 'terrestrial-bdav-partial-ts.m2ts'),
     ('IncompleteInput', 'terrestrial-tsreplace-h264.ts'),
     ('IncompleteMP4', 'terrestrial-psc-sidecar.mp4'),
 ], indirect=['recording'])
@@ -1073,6 +1085,32 @@ async def test_offline_video_session_failed_encoder_releases_slot(
     mp4_muxers: list[asyncio.subprocess.Process] = []
     injected = False
     original_wait = OfflineVideoSession.waitForCapacity
+    largest_pending_pes = 0
+    test_segment_limit = 16 * 1024
+    oversized_pes_continuation = b'\x47\x01\x00\x10' + bytes(ts.PACKET_SIZE - ts.HEADER_SIZE)
+
+    if failure == 'OversizedPES':
+        monkeypatch.setattr(OfflineVideoSession, 'MAX_SEGMENT_BYTES', test_segment_limit)
+        original_push = PESParser.push
+
+        def TrackPendingPES(parser: PESParser[PES], packet: bytes | bytearray | memoryview) -> None:
+            """
+            パーサーの動作を保ったまま、未確定の PES の最大サイズを記録する。
+
+            Args:
+                parser (PESParser[PES]): 計測対象のパーサー
+                packet (bytes | bytearray | memoryview): 入力 TS パケット
+
+            Returns:
+                None
+            """
+            nonlocal largest_pending_pes
+            original_push(parser, packet)
+            # 録画側のパーサーも同じクラスを使うため、異常を注入した出力パケットを対象とする。
+            if packet == oversized_pes_continuation and parser.pes is not None:
+                largest_pending_pes = max(largest_pending_pes, len(parser.pes))
+
+        monkeypatch.setattr(PESParser, 'push', TrackPendingPES)
 
     async def TrackEncoder(session: OfflineVideoSession, encoder: asyncio.subprocess.Process) -> bool:
         if encoder not in encoders and failure == 'PartialPacket':
@@ -1090,6 +1128,41 @@ async def test_offline_video_session_failed_encoder_releases_slot(
                 return chunk
 
             monkeypatch.setattr(encoder.stdout, 'read', ReadWithPartialEOF)
+        elif encoder not in encoders and failure in ('IncompletePES', 'OversizedPES'):
+            stdout = encoder.stdout
+            assert stdout is not None
+            original_read = stdout.read
+
+            async def ReadWithBrokenVideoPES(size: int = -1) -> bytes:
+                """
+                実際のエンコーダー出力の最初の映像 PES に異常を注入する。
+
+                Args:
+                    size (int): 元の stdout から読み出す最大サイズ
+
+                Returns:
+                    bytes: 異常を注入した TS、またはその続きの正常な TS
+                """
+                nonlocal injected
+                if injected:
+                    return await original_read(size)
+                prefix = bytearray()
+                while len(prefix) < 8 * 1024:
+                    packet = await stdout.readexactly(ts.PACKET_SIZE)
+                    prefix.extend(packet)
+                    if ts.pid(packet) == 0x100 and ts.payload_unit_start_indicator(packet):
+                        # FFmpeg の最初の映像 PES だけを書き換える。
+                        payload_start = len(prefix) - len(ts.payload(packet))
+                        if failure == 'IncompletePES':
+                            prefix[payload_start + 4:payload_start + 6] = b'\xff\xff'
+                        else:
+                            assert prefix[payload_start + 4:payload_start + 6] == b'\x00\x00'
+                            prefix.extend(oversized_pes_continuation * 256)
+                        injected = True
+                        return bytes(prefix)
+                raise AssertionError('FFmpeg did not start a video PES in its first 8 KiB.')
+
+            monkeypatch.setattr(stdout, 'read', ReadWithBrokenVideoPES)
         encoders.add(encoder)
         return await original_wait(session, encoder)
 
@@ -1138,7 +1211,14 @@ async def test_offline_video_session_failed_encoder_releases_slot(
     assert (await client.get(f'{url}?connection_id=2&next_sequence=0', headers=headers)).status_code == 410
     assert injected is True
     assert len(encoders) == 1
-    assert next(iter(encoders)).returncode == 0
+    returncode = next(iter(encoders)).returncode
+    if failure in ('IncompletePES', 'OversizedPES'):
+        assert returncode is not None
+    else:
+        assert returncode == 0
+    if failure == 'OversizedPES':
+        # 次の PES を待ってから失敗すると、すべての継続パケットが PES パーサーに蓄積される。
+        assert test_segment_limit < largest_pending_pes <= test_segment_limit + ts.PACKET_SIZE
     if failure == 'IncompleteMP4':
         assert [process.returncode for process in mp4_muxers] == [0]
     async with asyncio.timeout(1):
