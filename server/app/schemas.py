@@ -272,9 +272,23 @@ class OfflineVideoSessionStreamMetadata(OfflineVideoSessionInfo):
 
 class OfflineVideoCheckpoint(BaseModel):
     # 端末への保存が確定した連続範囲の次の番号
-    next_sequence: Annotated[int, Field(ge=0, le=0xfffffffe, strict=True)]
+    next_sequence: Annotated[
+        int,
+        Field(
+            ge = 0,
+            le = 0xfffffffe,
+            strict = True,
+        ),
+    ]
     # 現在の HTTP 接続の番号。JavaScript で正確に扱える整数の範囲に収める
-    connection_id: Annotated[int, Field(ge=1, le=2**53 - 1, strict=True)]
+    connection_id: Annotated[
+        int,
+        Field(
+            ge = 1,
+            le = 2**53 - 1,
+            strict = True,
+        ),
+    ]
 
 class OfflineVideoSessionErrorDetail(TypedDict):
     code: str

@@ -1071,7 +1071,11 @@ class VideoEncodingTask:
 
                             try:
                                 # まず PAT/PMT を書き込む
-                                if WriteAllToPipe(tsreadex_stdin_write, tsreadex_stdin_write_generation_token, pat_pmt_data) is False:
+                                if WriteAllToPipe(
+                                    tsreadex_stdin_write,
+                                    tsreadex_stdin_write_generation_token,
+                                    pat_pmt_data,
+                                ) is False:
                                     return False
                                 # 次にファイルから読み込んだデータを書き込む
                                 packet_size = feed_ts_stream_info.packet_size if feed_ts_stream_info is not None else ts.PACKET_SIZE
@@ -1112,7 +1116,11 @@ class VideoEncodingTask:
                                             chunk[packet_offset + header_size:packet_offset + packet_size]
                                             for packet_offset in range(0, len(chunk) - packet_size + 1, packet_size)
                                         )
-                                    if WriteAllToPipe(tsreadex_stdin_write, tsreadex_stdin_write_generation_token, chunk) is False:
+                                    if WriteAllToPipe(
+                                        tsreadex_stdin_write,
+                                        tsreadex_stdin_write_generation_token,
+                                        chunk,
+                                    ) is False:
                                         break
                             except BrokenPipeError:
                                 # RAM 保存のパイプ切断は WriteAllToPipe() が処理済みなので、ここでは入力側の異常を伝える。

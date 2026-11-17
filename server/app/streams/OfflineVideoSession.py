@@ -451,14 +451,22 @@ class OfflineVideoSession:
                             return
                         if done:
                             break
-                        await send({'type': 'http.response.body', 'body': struct.pack('>II', 0xfffffffe, 0), 'more_body': True})
+                        await send({
+                            'type': 'http.response.body',
+                            'body': struct.pack('>II', 0xfffffffe, 0),
+                            'more_body': True,
+                        })
                         keepalive_deadline = loop.time() + self.KEEPALIVE_INTERVAL
                     matches_recording = recording_check.result()
                     # 一時的なエラーでは終端を省き、次の GET で再照合する。
                     if matches_recording is None:
                         return
                     if matches_recording:
-                        await send({'type': 'http.response.body', 'body': struct.pack('>II', 0xffffffff, sequence), 'more_body': True})
+                        await send({
+                            'type': 'http.response.body',
+                            'body': struct.pack('>II', 0xffffffff, sequence),
+                            'more_body': True,
+                        })
                     else:
                         self.close()
                 finally:
@@ -471,7 +479,11 @@ class OfflineVideoSession:
                 await asyncio.wait_for(self._changed.wait(), timeout=keepalive_deadline - loop.time())
             except TimeoutError:
                 if self._close_task is None and connection_id == self._connection_id:
-                    await send({'type': 'http.response.body', 'body': struct.pack('>II', 0xfffffffe, 0), 'more_body': True})
+                    await send({
+                        'type': 'http.response.body',
+                        'body': struct.pack('>II', 0xfffffffe, 0),
+                        'more_body': True,
+                    })
                 keepalive_deadline = loop.time() + self.KEEPALIVE_INTERVAL
 
     def bindResponse(self, connection_id: int, scope: CancelScope) -> bool:
