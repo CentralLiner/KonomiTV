@@ -269,7 +269,7 @@ class OfflineVideoSession:
 
         # 録画ファイルの応答が遅い間に GET が重なっても、進行中の照合を使う。
         if self._connection_recording_check is None or self._connection_recording_check.done():
-            self._connection_recording_check = asyncio.create_task(self._matchesRecording())
+            self._connection_recording_check = self._startRecordingCheck()
         recording_check = self._connection_recording_check
 
         # GET 自体の中断からは照合を独立させ、セッション終了時は待機中の GET に 410 を返す。
@@ -442,7 +442,7 @@ class OfflineVideoSession:
 
             if self._is_complete:
                 assert sequence == self._produced_next
-                recording_check = asyncio.create_task(self._matchesRecording())
+                recording_check = self._startRecordingCheck()
                 try:
                     # 終端前の DB・ファイル照合が遅くても、受信側の無通信タイムアウトを発生させない。
                     while True:
@@ -600,6 +600,37 @@ class OfflineVideoSession:
             tuple[int, str, str, int, datetime]: 録画ファイルの ID・パス・ハッシュ・サイズ・更新日時
         """
         return video.id, video.file_path, video.file_hash, video.file_size, video.file_modified_at
+
+    def _startRecordingCheck(self) -> asyncio.Task[bool | None]:
+        """
+        録画照合を開始し、想定外の例外が起きた場合は保存セッションを終了する。
+
+        Args:
+            なし
+
+        Returns:
+            asyncio.Task[bool | None]: 録画照合の結果を返すタスク
+        """
+
+        def FinishRecordingCheck(task: asyncio.Task[bool | None]) -> None:
+            """
+            GET が既に切断されていても、照合中の実装上の失敗を記録してセッションを回収する。
+
+            Args:
+                task (asyncio.Task[bool | None]): 終了した録画照合のタスク
+
+            Returns:
+                None
+            """
+            if task.cancelled():
+                return
+            if (error := task.exception()) is not None:
+                logging.error(f'[OfflineVideoSession] Recording verification failed. [video_id: {self.info.video_id}]', exc_info=error)
+                self.close()
+
+        task = asyncio.create_task(self._matchesRecording())
+        task.add_done_callback(FinishRecordingCheck)
+        return task
 
     async def _matchesRecording(self) -> bool | None:
         """

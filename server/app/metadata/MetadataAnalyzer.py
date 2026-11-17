@@ -664,7 +664,7 @@ class MetadataAnalyzer:
             f.seek(packet_size - ts.PACKET_SIZE)
             if f.read(1) != ts.SYNC_BYTE:
                 return False
-        duration_result = self.__calculateTSFileDuration(raise_on_error=raise_on_error)
+        duration_result = self.__calculateTSFileDuration(raise_on_error = raise_on_error)
         if duration_result is None:
             return False
         _, end_ts_offset = duration_result

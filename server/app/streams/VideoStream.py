@@ -242,6 +242,9 @@ class VideoStream:
             quality (QUALITY_TYPES): 映像の品質 (1080p-60fps ~ 240p)
             encoding_options (StreamEncodingOptions): ベース画質に追加するエンコードオプション
             offline_session (OfflineVideoSession | None): RAM 保存用ストリームを所有するセッション
+
+        Returns:
+            None
         """
 
         # インスタンス変数の型ヒントを定義
@@ -281,6 +284,20 @@ class VideoStream:
         基本一度 VideoStream 内部でセットされたら外部から変更されるべきではないので、読み取り専用にしている
         """
         return tuple(self._segments)
+
+
+    @property
+    def segment_duration_seconds(self) -> float:
+        """
+        フレームレートから算出した通常セグメント長を返す。
+
+        Args:
+            なし
+
+        Returns:
+            float: セグメントの基準長 (秒)
+        """
+        return self._segment_duration_seconds
 
 
     @property
@@ -403,20 +420,6 @@ class VideoStream:
         self._ensureSegmentsInitialized()
         await self.resolveSegmentSourcePosition(0)
         await self._video_encoding_task.run(0)
-
-
-    @property
-    def segment_duration_seconds(self) -> float:
-        """
-        フレームレートから算出した通常セグメント長を返す。
-
-        Args:
-            なし
-
-        Returns:
-            float: セグメントの基準長 (秒)
-        """
-        return self._segment_duration_seconds
 
 
     def getBufferRange(self) -> tuple[float, float]:

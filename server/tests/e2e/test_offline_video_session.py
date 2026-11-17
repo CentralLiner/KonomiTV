@@ -56,7 +56,18 @@ async def recording(
     request: pytest.FixtureRequest,
     analyzed_recordings: dict[Path, schemas.RecordedProgram],
 ) -> AsyncGenerator[tuple[int, Path]]:
-    """本番の録画スキャンとは独立に、短い録画をテスト用 DB に登録する。"""
+    """
+    本番の録画スキャンとは独立に、短い録画をテスト用 DB に登録する。
+
+    Args:
+        client (httpx.AsyncClient): サーバーの起動処理を済ませるテスト用 API クライアント
+        tmp_path (Path): 変更可能な録画のコピーを置くフォルダ
+        request (pytest.FixtureRequest): 録画フィクスチャ名を取得するためのリクエスト
+        analyzed_recordings (dict[Path, schemas.RecordedProgram]): フィクスチャの解析結果
+
+    Returns:
+        AsyncGenerator[tuple[int, Path]]: 登録した録画の ID とパス
+    """
     file_name: str = request.param
     source = FIXTURES_DIR / 'recorded' / file_name
 
@@ -254,7 +265,17 @@ async def test_offline_video_session_cancels_gets_waiting_for_recording_check(
     recording: tuple[int, Path],
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """同時の GET は照合を共有し、DELETE 後も停止した I/O は復帰まで枠を占有する。"""
+    """
+    同時の GET は照合を共有し、DELETE 後も停止した I/O は復帰まで枠を占有する。
+
+    Args:
+        client (httpx.AsyncClient): テスト用 API クライアント
+        recording (tuple[int, Path]): 登録済み録画の ID とパス
+        monkeypatch (pytest.MonkeyPatch): 録画のハッシュ照合を一時停止するために使用
+
+    Returns:
+        None
+    """
     video_id, _ = recording
     url = f'/api/streams/video/{video_id}/240p/offline-sessions/{uuid.uuid4().hex}'
     created = await client.put(url)
@@ -322,7 +343,21 @@ async def test_offline_video_session_keeps_final_boundary_frame_with_audio(
     frame_count: int,
     wrap_dts: bool,
 ) -> None:
-    """分割境界にある最終フレームを、主音声・副音声と同じ末尾セグメントに保持する。"""
+    """
+    分割境界にある最終フレームを、主音声・副音声と同じ末尾セグメントに保持する。
+
+    Args:
+        client (httpx.AsyncClient): テスト用 API クライアント
+        recording (tuple[int, Path]): 登録済み録画の ID とパス
+        monkeypatch (pytest.MonkeyPatch): 末尾を分割境界にそろえるために使用
+        quality (str): 保存に指定する画質
+        frame_rate (int): 映像のフレームレートを表す分子
+        frame_count (int): エンコーダーから出力するフレーム数
+        wrap_dts (bool): DTS の折り返しを発生させるか
+
+    Returns:
+        None
+    """
     original_build = VideoEncodingTask.buildFFmpegOptions
 
     def BuildWithFinalKeyFrame(task: VideoEncodingTask, quality: QUALITY_TYPES, output_ts_offset: float) -> list[str]:
@@ -447,7 +482,17 @@ async def test_offline_video_session_reconnects_while_waiting_for_capacity(
     recording: tuple[int, Path],
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """未確認データと送信中の参照を保持し、再接続後の ACK で同じエンコーダーを再開する。"""
+    """
+    未確認データと送信中の参照を保持し、再接続後の ACK で同じエンコーダーを再開する。
+
+    Args:
+        client (httpx.AsyncClient): テスト用 API クライアント
+        recording (tuple[int, Path]): 登録済み録画の ID とパス
+        monkeypatch (pytest.MonkeyPatch): RAM の上限とエンコーダーの待機を観察するために使用
+
+    Returns:
+        None
+    """
     from app.app import app
 
     # 次のセグメントの予約が、前のセグメントの解放を待つ大きさにする。
@@ -695,27 +740,40 @@ async def test_offline_video_session_sends_keepalive_during_final_validation(
     recording: tuple[int, Path],
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """終端照合の I/O 待ちにも keepalive を送り、照合後だけ正常終端を公開する。"""
+    """
+    終端照合の I/O 待ちにも keepalive を送り、実装上の例外が起きた場合は保存を終了する。
+
+    Args:
+        client (httpx.AsyncClient): テスト用 API クライアント
+        recording (tuple[int, Path]): 登録済み録画の ID とパス
+        monkeypatch (pytest.MonkeyPatch): 終端照合の待ち時間と例外を再現する
+
+    Returns:
+        None
+    """
     checking = asyncio.Event()
     release = asyncio.Event()
     keepalive = asyncio.Event()
     original_stream = OfflineVideoSession.stream
+    fail_check = False
 
     async def CheckWithDelay(_session: OfflineVideoSession) -> bool:
         checking.set()
         await asyncio.wait_for(release.wait(), 10)
+        if fail_check:
+            raise RuntimeError('Unexpected recording validation error')
         return True
 
     async def TrackStream(session: OfflineVideoSession, connection_id: int, next_sequence: int, send: Send) -> None:
-        # 初回 GET の照合が済んだ時点で、正常終端の公開前の照合に待ち時間を入れる。
-        monkeypatch.setattr(OfflineVideoSession, '_matchesRecording', CheckWithDelay)
-
         async def TrackSend(message: Message) -> None:
             if checking.is_set() and message.get('body') == struct.pack('>II', 0xfffffffe, 0):
                 keepalive.set()
             await send(message)
 
-        await original_stream(session, connection_id, next_sequence, TrackSend)
+        # GET の照合が済んだ時点で、正常終端の公開前の照合に待ち時間を入れる。
+        with monkeypatch.context() as patch:
+            patch.setattr(OfflineVideoSession, '_matchesRecording', CheckWithDelay)
+            await original_stream(session, connection_id, next_sequence, TrackSend)
 
     monkeypatch.setattr(OfflineVideoSession, 'stream', TrackStream)
     monkeypatch.setattr(OfflineVideoSession, 'KEEPALIVE_INTERVAL', 0.02)
@@ -734,6 +792,15 @@ async def test_offline_video_session_sends_keepalive_during_final_validation(
         assert response.status_code == 200
         segments, count = ReadSegments(response.content)
         assert len(segments) == count > 0
+
+        # 再接続時の照合は通し、終端を公開する直前の照合で実装上の例外を発生させる。
+        fail_check = True
+        response = await client.get(f'{url}?connection_id=2&next_sequence={count}', headers=headers)
+        assert response.status_code == 200
+        with pytest.raises(struct.error):
+            ReadSegments(response.content, first_sequence=count)
+        response = await client.get(f'{url}?connection_id=3&next_sequence={count}', headers=headers)
+        assert response.status_code == 410
     finally:
         release.set()
         await client.delete(url, headers=headers)
@@ -775,7 +842,18 @@ async def test_offline_video_session_releases_slot_during_input_read(
     monkeypatch: pytest.MonkeyPatch,
     phase: str,
 ) -> None:
-    """入力が停止していても、キャンセルや起動失敗から実行枠を回収する。"""
+    """
+    入力が停止していても、キャンセルや起動失敗から実行枠を回収する。
+
+    Args:
+        client (httpx.AsyncClient): テスト用 API クライアント
+        recording (tuple[int, Path]): 登録済み録画の ID とパス
+        monkeypatch (pytest.MonkeyPatch): 入力ファイルの読み取りを一時停止するために使用
+        phase (str): 入力フィードの停止中に発生させる事象
+
+    Returns:
+        None
+    """
     video_id, path = recording
     loop = asyncio.get_running_loop()
     read_started = asyncio.Event()
@@ -923,7 +1001,18 @@ async def test_offline_video_session_retries_probe_only_before_publication(
     monkeypatch: pytest.MonkeyPatch,
     failure: str,
 ) -> None:
-    """公開前の解析失敗を再試行し、実装上の例外と公開後の失敗ではセッションを終了する。"""
+    """
+    公開前の解析失敗を再試行し、実装上の例外と公開後の失敗ではセッションを終了する。
+
+    Args:
+        client (httpx.AsyncClient): テスト用 API クライアント
+        recording (tuple[int, Path]): 登録済み録画の ID とパス
+        monkeypatch (pytest.MonkeyPatch): エンコーダーや入力処理の例外を再現するために使用
+        failure (str): 再現する失敗の種類
+
+    Returns:
+        None
+    """
     probe_durations: list[int] = []
     published_sequences: list[int] = []
     input_failures = 0
@@ -1091,7 +1180,18 @@ async def test_offline_video_session_failed_encoder_releases_slot(
     monkeypatch: pytest.MonkeyPatch,
     failure: str,
 ) -> None:
-    """異常 EOF で正常終端を送らず、再接続と実行枠を解放する。"""
+    """
+    異常 EOF で正常終端を送らず、再接続と実行枠を解放する。
+
+    Args:
+        client (httpx.AsyncClient): テスト用 API クライアント
+        recording (tuple[int, Path]): 登録済み録画の ID とパス
+        monkeypatch (pytest.MonkeyPatch): 入力または出力の異常終了を再現するために使用
+        failure (str): 再現する失敗の種類
+
+    Returns:
+        None
+    """
     video_id, path = recording
     encoders: set[asyncio.subprocess.Process] = set()
     mp4_muxers: list[asyncio.subprocess.Process] = []

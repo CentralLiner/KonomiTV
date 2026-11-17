@@ -53,6 +53,9 @@ class VideoEncodingTask:
 
         Args:
             video_stream (VideoStream): エンコードタスクが紐づく録画視聴セッションのインスタンス
+
+        Returns:
+            None
         """
 
         # このエンコードタスクが紐づく録画視聴セッションのインスタンス
@@ -64,7 +67,7 @@ class VideoEncodingTask:
         self._tsreadex_process: asyncio.subprocess.Process | None = None
         self._encoder_process: asyncio.subprocess.Process | None = None
 
-        # tsreadex への入力パイプの書き込みタスク
+        # tsreadex への入力パイプの書き込みタスク。run() が終了処理を行い、RAM 保存時は末尾まで書けたかも確認する。
         self._tsreadex_feed_task: asyncio.Future[bool] | None = None
         # tsreadex の stdin の書き込み用ファイルディスクリプタと、それがどの世代のパイプかを示すトークン
         ## FeedTSStream() では run_in_executor() からワーカースレッドでこれらを参照し、
@@ -407,6 +410,9 @@ class VideoEncodingTask:
 
         Args:
             start_sequence (int): エンコードを開始するセグメントのシーケンス番号
+
+        Returns:
+            None
         """
 
         # エンコーダーの種類を取得
@@ -657,7 +663,7 @@ class VideoEncodingTask:
             try:
                 offset_local = 0
                 while offset_local < len(data):
-                    # 旧世代の feed スレッドが、新しく再利用された FD に書き込まないようにする
+                    # 現在の世代に登録されている FD にだけ書き込む。
                     if self.__isTSReadExInputPipeCurrent(pipe_fd, generation_token) is False:
                         return False
                     try:
@@ -674,44 +680,6 @@ class VideoEncodingTask:
             finally:
                 if write_fd != pipe_fd:
                     os.close(write_fd)
-
-        def FeedOfflineMP4Stream(pipe_fd: int, generation_token: object) -> bool:
-            """
-            RAM 保存用に、psisimux が合成する TS を終端まで tsreadex へ供給する。
-
-            Args:
-                pipe_fd (int): tsreadex の入力パイプの書き込み側 FD
-                generation_token (object): 入力パイプの世代
-
-            Returns:
-                bool: psisimux が宣言した末尾まで供給できた場合は True
-            """
-
-            try:
-                # 読み込みパイプの所有権を引き継ぐ。起動前に回収された場合はここで終了する。
-                try:
-                    psisimux_input = pending_psisimux_input.get_nowait()
-                except queue.Empty:
-                    return False
-
-                # -p のヘッダーから期待する出力サイズを読み、TS 本体だけを tsreadex に渡す。
-                with psisimux_input:
-                    header = psisimux_input.read(ts.PACKET_SIZE)
-                    if len(header) != ts.PACKET_SIZE or header[:4] != b'\x47\x1f\xff\x10':
-                        return False
-                    remaining = int.from_bytes(header[8:16], 'little') - int.from_bytes(header[16:24], 'little')
-                    if remaining <= 0 or remaining % ts.PACKET_SIZE != 0:
-                        return False
-                    while chunk := psisimux_input.read(64 * 1024):
-                        remaining -= len(chunk)
-                        if remaining < 0 or not WriteAllToPipe(pipe_fd, generation_token, chunk):
-                            return False
-                    return remaining == 0
-            finally:
-                self.__closeTSReadExInputPipe(
-                    expected_pipe_fd = pipe_fd,
-                    expected_generation_token = generation_token,
-                )
 
         # エンコーダーの stderr は試行ごとに必ず読み続け、パイプ詰まりを防ぎつつ失敗時の診断ログを保持する
         ## 1 回のエンコーダー起動ごとに直近 1000 件だけを保持し、リトライ時に失敗した試行のログとして出力する
@@ -1189,27 +1157,53 @@ class VideoEncodingTask:
                                     )
                             return False
 
-                        def FeedOfflineTSStream(pipe_fd: int, generation_token: object, source_file_position: int) -> bool:
+                        def FeedOfflineInput(
+                            pipe_fd: int,
+                            generation_token: object,
+                            source_file_position: int | None,
+                        ) -> bool:
                             """
-                            RAM 保存ではワーカーが試行ごとに録画を開いて入力を供給する。
+                            RAM 保存用の TS を末尾まで tsreadex に供給し、入力パイプを閉じる。
 
                             Args:
                                 pipe_fd (int): 入力パイプの書き込み側 FD
                                 generation_token (object): 入力パイプの世代
-                                source_file_position (int): 録画ファイルの入力開始位置
+                                source_file_position (int | None): 録画ファイルの入力開始位置。MP4 は None
 
                             Returns:
-                                bool: ファイルの末尾まで供給できた場合は True
+                                bool: 録画ファイルまたは合成 TS の末尾まで供給できた場合は True
                             """
 
-                            if not self.__isTSReadExInputPipeCurrent(pipe_fd, generation_token):
-                                return False
                             try:
-                                with open(file_path, 'rb') as source:
-                                    source.seek(source_file_position)
-                                    return FeedTSStream(pipe_fd, generation_token, source)
+                                # TS 録画は読み取りを担当するワーカー内で開閉する。
+                                if source_file_position is not None:
+                                    if not self.__isTSReadExInputPipeCurrent(pipe_fd, generation_token):
+                                        return False
+                                    with open(file_path, 'rb') as source:
+                                        source.seek(source_file_position)
+                                        return FeedTSStream(pipe_fd, generation_token, source)
+
+                                # MP4 は psisimux の読み込みパイプを引き継ぐ。起動前に回収済みなら終了する。
+                                try:
+                                    psisimux_input = pending_psisimux_input.get_nowait()
+                                except queue.Empty:
+                                    return False
+
+                                # -p のヘッダーから期待する出力サイズを読み、TS 本体だけを tsreadex に渡す。
+                                with psisimux_input:
+                                    header = psisimux_input.read(ts.PACKET_SIZE)
+                                    if len(header) != ts.PACKET_SIZE or header[:4] != b'\x47\x1f\xff\x10':
+                                        return False
+                                    remaining = int.from_bytes(header[8:16], 'little') - int.from_bytes(header[16:24], 'little')
+                                    if remaining <= 0 or remaining % ts.PACKET_SIZE != 0:
+                                        return False
+                                    while chunk := psisimux_input.read(64 * 1024):
+                                        remaining -= len(chunk)
+                                        if remaining < 0 or not WriteAllToPipe(pipe_fd, generation_token, chunk):
+                                            return False
+                                    return remaining == 0
                             finally:
-                                # ファイルの処理が完了したら、途中で失敗した場合も tsreadex に EOF を届ける。
+                                # 処理結果にかかわらず、tsreadex に EOF を届ける。
                                 self.__closeTSReadExInputPipe(
                                     expected_pipe_fd = pipe_fd,
                                     expected_generation_token = generation_token,
@@ -1250,18 +1244,12 @@ class VideoEncodingTask:
                                 file,
                             )
                         # RAM 保存は、録画 I/O の専用プールでファイルまたは合成 TS の末尾まで検証する。
-                        elif psisimux_read_pipe is not None:
-                            pending_psisimux_input.put(os.fdopen(psisimux_read_pipe, 'rb'))
-                            psisimux_read_pipe = None
-                            self._tsreadex_feed_task = asyncio.create_task(offline_session.runFileIO(
-                                FeedOfflineMP4Stream,
-                                tsreadex_stdin_write,
-                                tsreadex_stdin_write_generation_token,
-                            ))
                         else:
-                            assert current_segment.source_file_position is not None
+                            if psisimux_read_pipe is not None:
+                                pending_psisimux_input.put(os.fdopen(psisimux_read_pipe, 'rb'))
+                                psisimux_read_pipe = None
                             self._tsreadex_feed_task = asyncio.create_task(offline_session.runFileIO(
-                                FeedOfflineTSStream,
+                                FeedOfflineInput,
                                 tsreadex_stdin_write,
                                 tsreadex_stdin_write_generation_token,
                                 current_segment.source_file_position,
@@ -1603,7 +1591,16 @@ class VideoEncodingTask:
                                 # )
 
                                 # 現在の映像 PES が安全に分割できるランダムアクセスフレームかを判定
-                                def _has_random_access_frame(pes: PES) -> bool:
+                                def HasRandomAccessFrame(pes: PES) -> bool:
+                                    """
+                                    映像 PES を調べ、セグメントの先頭にできるフレームを判定する。
+
+                                    Args:
+                                        pes (PES): エンコーダーの映像 PES
+
+                                    Returns:
+                                        bool: ランダムアクセスフレームを含む場合は True
+                                    """
                                     try:
                                         if isinstance(pes, H264PES):
                                             for ebsp in pes.ebsps:
@@ -1620,7 +1617,7 @@ class VideoEncodingTask:
                                         if offline_session is not None:
                                             raise
                                     return False
-                                has_random_access_frame = _has_random_access_frame(video)
+                                has_random_access_frame = HasRandomAccessFrame(video)
 
                                 # 次のセグメントの開始時刻以上になったら、現在のセグメントを確定して次のセグメントへ移行
                                 is_reached_planned_boundary = (current_timestamp_unwrapped >= next_segment_start_timestamp)
@@ -1990,7 +1987,7 @@ class VideoEncodingTask:
             ## 通常はここに到達した時点でフィードタスクの asyncio.wait_for() が完了しているので問題ない
             ## 上の asyncio.wait_for() がタイムアウトしてワーカースレッドが file.read() のままになっているケースについては、
             ## FeedTSStream() 側で ValueError を捕捉して正常終了として扱うようにしてある
-            ## RAM 保存では別スレッドから close() を待つと read() の内部ロックで回収が止まるため、ここでは閉じない。
+            ## RAM 保存はワーカー内で読み取りと close() を直列に行い、読み取り中もエンコード側の回収を進める。
             if file is not None:
                 file.close()
 
@@ -2008,7 +2005,7 @@ class VideoEncodingTask:
             logging.debug(f'{self.video_stream.log_prefix} Final cleanup completed.')
 
             if offline_session is None:
-                # キャンセル時は、最後のバッファを公開せずに終了する。
+                # キャンセルを検出したら、直ちに終了する。
                 if self._is_cancelled is True:
                     return
 
