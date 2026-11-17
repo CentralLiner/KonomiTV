@@ -1,4 +1,5 @@
 
+import Message from '@/message';
 import APIClient from  '@/services/APIClient';
 import { IChannel } from '@/services/Channels';
 import Utils, { CommentUtils } from '@/utils';
@@ -390,16 +391,25 @@ class Videos {
     /**
      * 録画番組を削除する
      * @param video_id 録画番組の ID
+     * @param expected_video 削除確認に表示した録画ファイルの情報
      * @returns 削除に成功した場合は true
      */
-    static async deleteVideo(video_id: number): Promise<boolean> {
+    static async deleteVideo(video_id: number, expected_video?: Pick<IRecordedVideo, 'file_path' | 'file_hash'>): Promise<boolean> {
 
         // API リクエストを実行
-        const response = await APIClient.delete(`/videos/${video_id}`);
+        const response = await APIClient.delete(`/videos/${video_id}`, expected_video === undefined ? undefined : {
+            data: {
+                file_path: expected_video.file_path,
+                file_hash: expected_video.file_hash,
+            },
+        });
 
         // エラー処理
         if (response.type === 'error') {
             switch (response.data.detail) {
+                case 'The confirmed recording file is no longer available.':
+                    Message.warning('確認した録画ファイルを削除できません。録画番組一覧から対象を確認してください。');
+                    break;
                 default:
                     APIClient.showGenericError(response, '録画ファイルの削除に失敗しました。');
                     break;

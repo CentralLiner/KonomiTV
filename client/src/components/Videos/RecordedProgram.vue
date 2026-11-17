@@ -266,7 +266,7 @@
         <v-card>
             <v-card-title class="d-flex justify-center pt-6 font-weight-bold">本当に録画ファイルを削除しますか？</v-card-title>
             <v-card-text class="pt-2 pb-0">
-                <div class="delete-confirmation__file-path mb-4">{{recordingToDelete.filePath}}</div>
+                <div class="delete-confirmation__file-path mb-4">{{recordingToDelete.file_path}}</div>
                 <div class="text-error-lighten-1 font-weight-bold">
                     この録画ファイルに関連するすべてのデータ (サムネイル / .ts.program.txt / .ts.err を含む) が削除されます。<br>
                     元に戻すことはできません。本当に録画ファイルを削除しますか？
@@ -333,7 +333,7 @@ const show_video_info = ref(false);
 // 削除確認ダイアログの表示状態
 const show_delete_confirmation = ref(false);
 // 確認を開いた時点の録画ファイルを操作対象にする。
-const recordingToDelete = ref<{id: number; fileHash: string; filePath: string} | null>(null);
+const recordingToDelete = ref<{id: number; file_hash: string; file_path: string} | null>(null);
 // オフライン保存ダイアログの表示状態
 const showOfflineDownload = ref(false);
 const showOfflineJobDismissConfirmation = ref(false);
@@ -595,8 +595,8 @@ const showDeleteConfirmation = () => {
     }
     recordingToDelete.value = {
         id: props.program.id,
-        fileHash: props.program.recorded_video.file_hash,
-        filePath: props.program.recorded_video.file_path,
+        file_hash: props.program.recorded_video.file_hash,
+        file_path: props.program.recorded_video.file_path,
     };
     show_delete_confirmation.value = true;
 };
@@ -607,25 +607,15 @@ const deleteVideo = async () => {
     if (recording === null || !show_delete_confirmation.value) return;
     show_delete_confirmation.value = false;
 
-    // オフライン一覧からの操作では、確認に表示したファイルをサーバーの最新情報と照合する。
-    if (props.forOffline) {
-        const program = await Videos.fetchVideo(recording.id);
-        if (program === null) return;
-        const video = program.recorded_video;
-        if (video.file_hash !== recording.fileHash || video.file_path !== recording.filePath ||
-            video.status === 'Recording' || video.status === 'Missing') {
-            Message.warning('確認した録画ファイルを削除できません。録画番組一覧から対象を確認してください。');
-            return;
-        }
-    }
     Message.info('録画ファイルの削除を開始します。完了までしばらくお待ちください。');
 
-    const result = await Videos.deleteVideo(recording.id);
+    // オフライン一覧からは、削除するサーバーの録画ファイルを確認済みの情報で指定する。
+    const result = await Videos.deleteVideo(recording.id, props.forOffline ? recording : undefined);
     if (result === true) {
         Message.success('録画ファイルを削除しました。');
         // 録画番組一覧で同じファイルを表示している場合に行を取り除き、端末の保存済み動画は一覧に残す。
         if (!props.forOffline && props.program.id === recording.id &&
-            props.program.recorded_video.file_hash === recording.fileHash && props.program.recorded_video.file_path === recording.filePath) {
+            props.program.recorded_video.file_hash === recording.file_hash && props.program.recorded_video.file_path === recording.file_path) {
             emit('deleted', recording.id);
         }
     }
