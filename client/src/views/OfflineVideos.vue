@@ -148,10 +148,13 @@ const refreshActiveJobProgress = async (): Promise<void> => {
 
             // 非同期取得の途中で Waiting を画面へ反映せず、受信量と状態を確定してからまとめて更新する
             let nextDownloadedBytes = latestJob.downloaded_bytes;
+            let nextState = latestJob.state;
             if (latestJob.background_fetch_id !== null) {
                 nextDownloadedBytes = Math.max(job.downloaded_bytes, nextDownloadedBytes);
+                if (nextState === 'Waiting' && nextDownloadedBytes > 0) {
+                    nextState = 'Downloading';
+                }
             }
-            let nextState = latestJob.state;
 
             // Background Fetch 中はブラウザ側の受信量の方が進んでいることが多い
             if (latestJob.background_fetch_id !== null && backgroundFetchManager !== undefined &&
@@ -194,6 +197,19 @@ const refresh = async (): Promise<void> => {
     try {
         const nextVideos = await OfflineVideos.getVideos();
         const nextJobs = await OfflineVideos.getJobs();
+
+        // Background Fetch の登録が消えた後も、同じジョブの展開中は表示済みの受信量を引き継ぐ。
+        const previousActiveJobs = activeJobs.value;
+        for (const job of nextJobs) {
+            if (job.background_fetch_id === null || ['Waiting', 'Downloading', 'Finalizing'].includes(job.state) === false) continue;
+            const previousJob = previousActiveJobs.find(candidate => candidate.job_id === job.job_id);
+            if (previousJob !== undefined) {
+                job.downloaded_bytes = Math.max(job.downloaded_bytes, previousJob.downloaded_bytes);
+                if (job.state === 'Waiting' && job.downloaded_bytes > 0) {
+                    job.state = 'Downloading';
+                }
+            }
+        }
 
         // jobs.value 代入前に Background Fetch 進捗を取り込み、0 バイト表示の中間フレームを出さない
         await applyBackgroundFetchProgress(nextJobs);

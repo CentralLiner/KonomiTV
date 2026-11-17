@@ -195,9 +195,9 @@
                 <Icon icon="fluent:delete-20-regular" width="20px" height="20px" />
             </v-btn>
         </div>
-        <div v-if="displayedOfflineDownloadProgress !== null" class="recorded-program__offline-progress">
+        <div v-if="offlineDownloadProgress !== null" class="recorded-program__offline-progress">
             <div class="recorded-program__offline-progress-bar"
-                :style="`width: ${displayedOfflineDownloadProgress}%`">
+                :style="`width: ${offlineDownloadProgress}%`">
             </div>
         </div>
     </component>
@@ -524,22 +524,6 @@ const offlineDownloadProgress = computed(() => {
     if (props.offlineDownloadJob.estimated_size_bytes <= 0) return 0;
     return Math.min(99, (props.offlineDownloadJob.downloaded_bytes / props.offlineDownloadJob.estimated_size_bytes) * 100);
 });
-
-// Background Fetch は受信完了後の展開中も進捗を維持し、通常 Fetch は再接続時の確定位置を表示する
-const displayedOfflineDownloadProgress = ref<number | null>(null);
-watch(
-    () => [props.offlineDownloadJob?.job_id, offlineDownloadProgress.value] as const,
-    ([jobID, progress], previous) => {
-        const job = props.offlineDownloadJob;
-        if (job !== null && job.background_fetch_id !== null && jobID === previous?.[0] && progress !== null) {
-            displayedOfflineDownloadProgress.value = Math.max(displayedOfflineDownloadProgress.value ?? 0, progress);
-        } else {
-            // 新しいジョブと終了済みのジョブでは、前の表示値を初期化する
-            displayedOfflineDownloadProgress.value = progress;
-        }
-    },
-    { immediate: true },
-);
 
 // 実行中の保存ジョブをキャンセルする
 const cancelOfflineDownload = () => {

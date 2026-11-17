@@ -336,6 +336,7 @@ export default class OfflineVideos {
                     }
                     await this.updateJob(job);
                     controller.signal.throwIfAborted();
+                    // オフライン保存 API は認証不要なので、ページ終了後もブラウザが単独で取得できる通常の Request を作成する
                     const request = new Request(`${Utils.api_base_url}/streams/video/${job.video_id}/${quality}/offline-stream`);
                     const backgroundFetch = await manager.fetch(job.background_fetch_id, [request], {
                         title: `${programSnapshot.title}をオフライン保存`,
@@ -359,8 +360,8 @@ export default class OfflineVideos {
                 }
                 return job;
             } catch (error) {
+                const wasCancelled = controller.signal.aborted;
                 if (isRegistered) {
-                    const wasCancelled = controller.signal.aborted;
                     controller.abort();
                     // 準備処理の終了後に状態を確定し、未完成データを一度だけ回収する。
                     if (wasCancelled) {
@@ -372,6 +373,9 @@ export default class OfflineVideos {
                     }
                     await this.deleteIncompleteGeneration(job);
                     this.notifyChange();
+                }
+                if (wasCancelled) {
+                    throw new Error('オフライン保存はキャンセルされました。');
                 }
                 throw error;
             } finally {
@@ -410,6 +414,7 @@ export default class OfflineVideos {
     }
 
     private static async prepareAssets(job: IOfflineDownloadJob, signal: AbortSignal): Promise<void> {
+        // 番組一覧とシークバーが通信なしでも描画できるよう、小さな付随データは動画本体より先に同じ世代へ保存する
         const cache = await OfflineVideoStorage.openCache();
         const baseURL = OfflineVideoStorage.getGenerationBaseURL(job.video_id, job.generation_id);
         const assets = [
@@ -570,6 +575,8 @@ export default class OfflineVideos {
                     console.warn('[OfflineVideos] Failed to acquire a screen wake lock:', error);
                 }
             }
+            // 無音音声は Chrome のバックグラウンド保護対象にならないため、ローカル WebRTC 接続でページ凍結を抑える
+            // マイク権限や外部サーバーを使わない RTCDataChannel を、動画転送が終わるまで開いたまま保持する
             try {
                 signal.throwIfAborted();
                 releaseActivity = await this.acquireForegroundActivityProtection(signal);
@@ -1097,6 +1104,7 @@ export default class OfflineVideos {
         if (!await OfflineVideoStorage.completeJob(job, video)) {
             throw new Error('オフライン保存はすでに終了しています。');
         }
+        // 有効世代を切り替えた後なら、削除中も必ず新しい保存データから再生できる
         if (previousVideo !== null && previousVideo.generation_id !== video.generation_id) {
             await OfflineVideoStorage.deleteGeneration(previousVideo.video_id, previousVideo.generation_id).catch((error: unknown) => {
                 console.warn('[OfflineVideos] Failed to delete the previous offline video data:', error);
