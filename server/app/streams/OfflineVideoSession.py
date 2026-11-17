@@ -156,7 +156,8 @@ class OfflineVideoSession:
             tuple[OfflineVideoSession, bool]: 対象のセッションと、新規登録したかどうか
         """
         recorded_video = recorded_program.recorded_video
-        if recorded_video.status != 'Recorded':
+        # 旧経路と同様に、解析失敗後も登録情報が残っている録画を保存対象にする。
+        if recorded_video.status not in ('Recorded', 'AnalysisFailed'):
             raise OfflineVideoSessionError(409, 'recording_unavailable')
 
         # ファイル I/O や await を挟まず、上限確認と登録を一度に行う。
@@ -655,7 +656,7 @@ class OfflineVideoSession:
             bool | None: 録画が一致すれば True、変更されていれば False、一時的な I/O 障害なら None
         """
         recorded_program = await RecordedProgram.filter(id=self.info.video_id).get_or_none().select_related('recorded_video')
-        if recorded_program is None or recorded_program.recorded_video.status != 'Recorded':
+        if recorded_program is None or recorded_program.recorded_video.status not in ('Recorded', 'AnalysisFailed'):
             return False
         video = recorded_program.recorded_video
         if self._recordingFields(video) != self._recordingFields(self._recorded_program.recorded_video):

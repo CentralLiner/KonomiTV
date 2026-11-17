@@ -199,6 +199,38 @@ async def test_offline_video_session_replays_the_same_output(
     assert (await client.delete(url, headers=headers)).status_code == 409
 
 
+async def test_offline_video_session_accepts_analyzed_recording_with_failed_rescan(
+    client: httpx.AsyncClient,
+    recording: tuple[int, Path],
+) -> None:
+    """
+    再解析に失敗した状態でも、登録済みの録画情報とファイルが一致すれば保存と再接続ができる。
+
+    Args:
+        client (httpx.AsyncClient): テスト用 API クライアント
+        recording (tuple[int, Path]): 登録済み録画の ID とパス
+
+    Returns:
+        None
+    """
+    video_id, _ = recording
+    # 再解析の失敗でステータスだけ更新され、有効な録画情報が残った状態を再現する。
+    await RecordedVideo.filter(recorded_program_id=video_id).update(status='AnalysisFailed')
+    url = f'/api/streams/video/{video_id}/240p/offline-sessions/{uuid.uuid4().hex}'
+    created = await client.put(url)
+    assert created.status_code == 201
+    headers = {'X-KonomiTV-Offline-Generation': created.json()['generation_token']}
+
+    response = await client.get(f'{url}?connection_id=1&next_sequence=0', headers=headers)
+    assert response.status_code == 200
+    segments, count = ReadSegments(response.content)
+    assert count >= 2
+
+    replay = await client.get(f'{url}?connection_id=2&next_sequence=1', headers=headers)
+    assert replay.status_code == 200
+    assert ReadSegments(replay.content, first_sequence=1) == (segments[1:], count)
+
+
 async def test_offline_video_session_revalidates_recording_on_reconnect(
     client: httpx.AsyncClient,
     recording: tuple[int, Path],
@@ -1208,6 +1240,7 @@ async def test_offline_video_session_cancels_encoder_retry(
 @pytest.mark.parametrize(('failure', 'recording'), [
     ('PartialPacket', 'terrestrial-bdav-partial-ts.m2ts'),
     ('IncompletePES', 'terrestrial-bdav-partial-ts.m2ts'),
+    ('IncompleteSecondaryAudioPES', 'terrestrial-bdav-partial-ts.m2ts'),
     ('OversizedPES', 'terrestrial-bdav-partial-ts.m2ts'),
     ('IncompleteInput', 'terrestrial-tsreplace-h264.ts'),
     ('IncompleteMP4', 'terrestrial-psc-sidecar.mp4'),
@@ -1278,14 +1311,16 @@ async def test_offline_video_session_failed_encoder_releases_slot(
                 return chunk
 
             monkeypatch.setattr(encoder.stdout, 'read', ReadWithPartialEOF)
-        elif encoder not in encoders and failure in ('IncompletePES', 'OversizedPES'):
+        elif encoder not in encoders and failure in ('IncompletePES', 'IncompleteSecondaryAudioPES', 'OversizedPES'):
             stdout = encoder.stdout
             assert stdout is not None
             original_read = stdout.read
+            # FFmpeg はこの設定で、映像に 0x100、副音声に 0x102 を割り当てる。
+            damaged_pid = 0x102 if failure == 'IncompleteSecondaryAudioPES' else 0x100
 
-            async def ReadWithBrokenVideoPES(size: int = -1) -> bytes:
+            async def ReadWithBrokenPES(size: int = -1) -> bytes:
                 """
-                実際のエンコーダー出力の最初の映像 PES に異常を注入する。
+                実際のエンコーダー出力の対象 PID の最初の PES に異常を注入する。
 
                 Args:
                     size (int): 元の stdout から読み出す最大サイズ
@@ -1297,22 +1332,21 @@ async def test_offline_video_session_failed_encoder_releases_slot(
                 if injected:
                     return await original_read(size)
                 prefix = bytearray()
-                while len(prefix) < 8 * 1024:
+                while len(prefix) < 64 * 1024:
                     packet = await stdout.readexactly(ts.PACKET_SIZE)
                     prefix.extend(packet)
-                    if ts.pid(packet) == 0x100 and ts.payload_unit_start_indicator(packet):
-                        # FFmpeg の最初の映像 PES だけを書き換える。
+                    if ts.pid(packet) == damaged_pid and ts.payload_unit_start_indicator(packet):
                         payload_start = len(prefix) - len(ts.payload(packet))
-                        if failure == 'IncompletePES':
+                        if failure != 'OversizedPES':
                             prefix[payload_start + 4:payload_start + 6] = b'\xff\xff'
                         else:
                             assert prefix[payload_start + 4:payload_start + 6] == b'\x00\x00'
                             prefix.extend(oversized_pes_continuation * 256)
                         injected = True
                         return bytes(prefix)
-                raise AssertionError('FFmpeg did not start a video PES in its first 8 KiB.')
+                raise AssertionError(f'FFmpeg did not start a PES for PID 0x{damaged_pid:04x} in its first 64 KiB.')
 
-            monkeypatch.setattr(stdout, 'read', ReadWithBrokenVideoPES)
+            monkeypatch.setattr(stdout, 'read', ReadWithBrokenPES)
         encoders.add(encoder)
         return await original_wait(session, encoder)
 
@@ -1362,7 +1396,7 @@ async def test_offline_video_session_failed_encoder_releases_slot(
     assert injected is True
     assert len(encoders) == 1
     returncode = next(iter(encoders)).returncode
-    if failure in ('IncompletePES', 'OversizedPES'):
+    if failure in ('IncompletePES', 'IncompleteSecondaryAudioPES', 'OversizedPES'):
         assert returncode is not None
     else:
         assert returncode == 0

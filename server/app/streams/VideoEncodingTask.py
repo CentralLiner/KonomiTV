@@ -564,6 +564,33 @@ class VideoEncodingTask:
                 # 長さ 0 の映像 PES は次の開始パケットまで伸びるため、追加の TS パケットが来るたびに確認する。
                 raise RuntimeError('Offline PES exceeded the maximum segment size.')
 
+        def FlushOfflinePESAtEOF(
+            video_parser: PESParser[PES],
+            video_pes_class: type[PES],
+            audio_parsers: tuple[PESParser[PES], ...],
+        ) -> None:
+            """
+            RAM 保存の正常 EOF で、保持中の最後の映像 PES を確定して音声 PES の完結を確認する。
+
+            Args:
+                video_parser (PESParser[PES]): 映像の PES パーサー
+                video_pes_class (type[PES]): 映像のコーデックに対応する PES クラス
+                audio_parsers (tuple[PESParser[PES], ...]): 主音声と副音声の PES パーサー
+
+            Returns:
+                None
+            """
+            # 長さ 0 の映像 PES は次の開始パケットの代わりに EOF で区切る。
+            if video_parser.pes:
+                video = video_pes_class(video_parser.pes)
+                if video.PES_packet_length() != 0:
+                    raise RuntimeError('Encoder output ended inside a video PES.')
+                video_parser.queue.append(video)
+                video_parser.pes = None
+            for audio_parser in audio_parsers:
+                if audio_parser.pes:
+                    raise RuntimeError('Encoder output ended inside an audio PES.')
+
         def AppendPES(pes: PES, pid: int, continuity_counter: int) -> int:
             """
             PES をセグメントに追加し、次の TS パケットの連続性カウンターを返す。
@@ -775,6 +802,8 @@ class VideoEncodingTask:
                 pmt_parser: SectionParser[PMTSection] = SectionParser(PMTSection)
                 video_parser: PESParser[PES] = PESParser(PES)
                 audio_parser: PESParser[PES] = PESParser(PES)
+                # 副音声は元の TS パケットを送信し、RAM 保存時だけ PES の完結を検証する。
+                secondary_audio_parsers: dict[int, PESParser[PES]] = {}
                 video_pes_class: type[PES] = PES
                 # PID と CC (Continuity Counter) をリセット
                 pmt_pid: int | None = None
@@ -1460,15 +1489,11 @@ class VideoEncodingTask:
                             if self._is_cancelled:
                                 break
 
-                            # 長さ 0 の映像 PES は次の開始パケットで区切られるため、EOF で最後の一件を取り出す。
-                            if video_parser.pes:
-                                video = video_pes_class(video_parser.pes)
-                                if video.PES_packet_length() != 0:
-                                    raise RuntimeError('Encoder output ended inside a video PES.')
-                                video_parser.queue.append(video)
-                                video_parser.pes = None
-                            if audio_parser.pes:
-                                raise RuntimeError('Encoder output ended inside an audio PES.')
+                            FlushOfflinePESAtEOF(
+                                video_parser,
+                                video_pes_class,
+                                (audio_parser, *secondary_audio_parsers.values()),
+                            )
                             is_output_eof = True
                             packet = b''
                             pid = video_pid
@@ -1526,6 +1551,10 @@ class VideoEncodingTask:
                                     if audio_pid is None:
                                         audio_pid = elementary_pid
                                         logging.debug(f'{self.video_stream.log_prefix} AAC PID: 0x{elementary_pid:04x}')
+                                    elif offline_session is not None and elementary_pid != audio_pid:
+                                        # PMT が再送されても、同じ PID の検証中の PES を引き継ぐ。
+                                        if elementary_pid not in secondary_audio_parsers:
+                                            secondary_audio_parsers[elementary_pid] = PESParser(PES)
                             # PMT を再構築して candidate に追加
                             for packet in packetize_section(pmt, False, False, cast(int, pmt_pid), 0, pmt_cc):
                                 append_packet(packet)
@@ -1708,6 +1737,11 @@ class VideoEncodingTask:
 
                     # その他のパケット
                     else:
+                        if pid is not None and pid in secondary_audio_parsers and ts.has_payload(packet):
+                            secondary_audio_parser = secondary_audio_parsers[pid]
+                            PushPES(secondary_audio_parser, packet)
+                            # 元のパケットをそのまま出力するため、検証済みの PES を手放す。
+                            secondary_audio_parser.queue.clear()
                         append_packet(packet)
 
                     if is_output_eof:
