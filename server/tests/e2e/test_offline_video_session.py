@@ -34,6 +34,7 @@ from app.streams.OfflineVideoSession import (
     OfflineVideoSession,
 )
 from app.streams.VideoEncodingTask import VideoEncodingTask
+from app.utils.TSKeyFrameSeeker import TSKeyFrameCollector
 from tests.conftest import FIXTURES_DIR
 
 
@@ -915,16 +916,17 @@ async def test_offline_video_session_capacity_and_recording_change(
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize('failure', ['InitialProbe', 'RetryLimit', 'AfterPublication'])
+@pytest.mark.parametrize('failure', ['InitialProbe', 'RetryLimit', 'AfterPublication', 'InputProgrammingError'])
 async def test_offline_video_session_retries_probe_only_before_publication(
     client: httpx.AsyncClient,
     recording: tuple[int, Path],
     monkeypatch: pytest.MonkeyPatch,
     failure: str,
 ) -> None:
-    """公開前の解析失敗だけを再試行し、上限到達と公開後の失敗では正常終端を送らない。"""
+    """公開前の解析失敗を再試行し、実装上の例外と公開後の失敗ではセッションを終了する。"""
     probe_durations: list[int] = []
     published_sequences: list[int] = []
+    input_failures = 0
     original_build = VideoEncodingTask.buildFFmpegOptions
     original_publish = OfflineVideoSession.publishSegment
     original_wait = OfflineVideoSession.waitForCapacity
@@ -939,7 +941,7 @@ async def test_offline_video_session_retries_probe_only_before_publication(
                 del options[index - 1:index + 1]
             # 短い録画でも終端前に分割できるよう、キーフレーム間隔を短くする。
             options[options.index('-g') + 1] = '15'
-        elif failure == 'RetryLimit' or len(probe_durations) == 1:
+        elif failure == 'RetryLimit' or (failure == 'InitialProbe' and len(probe_durations) == 1):
             # 解析時に音声を検出できなかった場合と同じ、FFmpeg の起動エラーを発生させる。
             options[options.index('0:a:1')] = '0:a:99'
         return options
@@ -958,6 +960,14 @@ async def test_offline_video_session_retries_probe_only_before_publication(
     monkeypatch.setattr(VideoEncodingTask, 'buildFFmpegOptions', BuildWithProbeFailure)
     monkeypatch.setattr(OfflineVideoSession, 'publishSegment', TrackPublication)
     monkeypatch.setattr(OfflineVideoSession, 'waitForCapacity', WaitAfterEarlyExit)
+    if failure == 'InputProgrammingError':
+        def FailInputCollection(_collector: TSKeyFrameCollector, _chunk: bytes, _chunk_file_offset: int) -> None:
+            nonlocal input_failures
+            input_failures += 1
+            raise TypeError('Unexpected error in input keyframe collection')
+
+        # 実録画の入力を最初のチャンクで止め、FFmpeg が映像・音声を出力する前の実装上の例外を再現する。
+        monkeypatch.setattr(TSKeyFrameCollector, 'push', FailInputCollection)
     video_id, _ = recording
     url = f'/api/streams/video/{video_id}/240p/offline-sessions/{uuid.uuid4().hex}'
     created = await client.put(url)
@@ -966,7 +976,9 @@ async def test_offline_video_session_retries_probe_only_before_publication(
 
     response = await client.get(f'{url}?connection_id=1&next_sequence=0', headers=headers)
     assert response.status_code == 200
-    assert len(probe_durations) == (1 if failure == 'AfterPublication' else 2)
+    assert len(probe_durations) == (2 if failure in ('InitialProbe', 'RetryLimit') else 1)
+    if failure == 'InputProgrammingError':
+        assert input_failures == 1
     if len(probe_durations) == 2:
         assert probe_durations[1] > probe_durations[0]
     if failure == 'InitialProbe':

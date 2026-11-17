@@ -445,6 +445,8 @@ class VideoEncodingTask:
             try:
                 await self.video_stream.ensureTSKeyFrameContext()
             except Exception as ex:
+                if offline_session is not None and not isinstance(ex, (OSError, RuntimeError)):
+                    raise
                 logging.warning(f'{self.video_stream.log_prefix} Failed to initialize input keyframe collector context:', exc_info=ex)
             if offline_session is None:
                 file = open(file_path, 'rb')
@@ -1161,14 +1163,20 @@ class VideoEncodingTask:
                                 ) and ex.errno in (errno.EBADF, errno.EINVAL):
                                     pass
                                 else:
+                                    if offline_session is not None:
+                                        raise
                                     logging.error(f'{self.video_stream.log_prefix} Error feeding data to tsreadex:', exc_info=ex)
                             except ValueError as ex:
+                                if offline_session is not None:
+                                    raise
                                 # ファイルが閉じられた場合（サーバーシャットダウン時など）
                                 if 'closed file' in str(ex):
                                     pass  # 正常なシャットダウンなので何もしない
                                 else:
                                     logging.error(f'{self.video_stream.log_prefix} Error feeding data to tsreadex:', exc_info=ex)
                             except Exception as ex:
+                                if offline_session is not None:
+                                    raise
                                 logging.error(f'{self.video_stream.log_prefix} Error feeding data to tsreadex:', exc_info=ex)
                             finally:
                                 # RAM 保存の入力は、録画ファイルを開く処理も含めてワーカー側の呼び出し元が回収する。
@@ -1978,7 +1986,10 @@ class VideoEncodingTask:
                     await RunOfflinePipeOperation(CloseOfflineInput)
 
             # 通常配信の録画ファイルを閉じる (RAM 保存ではワーカーが所有する)
-            ## 通常配信は従来どおりフィードの終了待ちの後で閉じる。
+            ## ワーカースレッドが file.read() の実行中に file.close() を呼ぶと ValueError になるが、
+            ## 通常はここに到達した時点でフィードタスクの asyncio.wait_for() が完了しているので問題ない
+            ## 上の asyncio.wait_for() がタイムアウトしてワーカースレッドが file.read() のままになっているケースについては、
+            ## FeedTSStream() 側で ValueError を捕捉して正常終了として扱うようにしてある
             ## RAM 保存では別スレッドから close() を待つと read() の内部ロックで回収が止まるため、ここでは閉じない。
             if file is not None:
                 file.close()

@@ -234,6 +234,7 @@ APIを追加して利用する変更はサーバーのコミットを先、ク�
 | 場所 | 責務 |
 | --- | --- |
 | `server/app/streams/OfflineVideoSession.py` 新規 | RAMセッションの所有権・ACK・容量・期限・接続引き継ぎ |
+| `server/app/metadata/MetadataAnalyzer.py` | 既存の録画ハッシュ照合で発生した I/O エラーを RAM セッションの呼び出し元へ伝える |
 | `server/app/routers/VideoStreamsRouter.py`、`schemas.py` | 新APIとフレーム形式、既存配信経路との実行枠共有 |
 | `server/app/streams/VideoStream.py`、`VideoEncodingTask.py` | 新経路だけの生成抑制・同一実行保証・正常終端 |
 | `server/app/app.py` | shutdown時のセッション回収 |

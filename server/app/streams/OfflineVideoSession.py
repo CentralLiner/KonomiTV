@@ -6,7 +6,6 @@ import struct
 from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
-from functools import partial
 from pathlib import Path
 from typing import ClassVar
 
@@ -602,38 +601,6 @@ class OfflineVideoSession:
         """
         return video.id, video.file_path, video.file_hash, video.file_size, video.file_modified_at
 
-    @staticmethod
-    def _getFileIdentity(video: RecordedVideo, *, verify_hash: bool) -> tuple[int, int, int, int, int] | None:
-        """
-        DB に登録された録画に対応する実ファイルの識別情報を取得する。
-
-        Args:
-            video (RecordedVideo): 照合する録画ファイルの DB レコード
-            verify_hash (bool): 初回接続時に実ファイルのハッシュも照合するか
-
-        Returns:
-            tuple[int, int, int, int, int] | None: stat() で取得したファイルの識別情報。欠損や不一致の場合は None
-        """
-        # ハッシュの計算とファイル操作はワーカースレッドで行う。
-        path = Path(video.file_path)
-        try:
-            before = path.stat()
-            if before.st_size != video.file_size:
-                return None
-            identity = (before.st_dev, before.st_ino, before.st_size, before.st_mtime_ns, before.st_ctime_ns)
-            # 同じ内容なら録画スキャンは DB の更新日時を更新しない。初回はサイズとハッシュを照合し、
-            # 以後の更新日時の変化はセッションが保持する実ファイルの identity で検出する。
-            if verify_hash:
-                if not MetadataAnalyzer(path).matchesFileHash(video.file_hash, raise_on_error=True):
-                    return None
-                # 読み取ったハッシュと記録する識別情報を同じファイルのものにそろえる。
-                after = path.stat()
-                if identity != (after.st_dev, after.st_ino, after.st_size, after.st_mtime_ns, after.st_ctime_ns):
-                    return None
-            return identity
-        except FileNotFoundError:
-            return None
-
     async def _matchesRecording(self) -> bool | None:
         """
         現在の録画情報と実ファイルをセッション作成時の録画と照合する。
@@ -647,15 +614,43 @@ class OfflineVideoSession:
         recorded_program = await RecordedProgram.filter(id=self.info.video_id).get_or_none().select_related('recorded_video')
         if recorded_program is None or recorded_program.recorded_video.status != 'Recorded':
             return False
-        if self._recordingFields(recorded_program.recorded_video) != self._recordingFields(self._recorded_program.recorded_video):
+        video = recorded_program.recorded_video
+        if self._recordingFields(video) != self._recordingFields(self._recorded_program.recorded_video):
             return False
+        verify_hash = self._file_identity is None
+
+        def GetFileIdentity() -> tuple[int, int, int, int, int] | None:
+            """
+            DB に登録された録画に対応する実ファイルの識別情報を取得する。
+
+            Args:
+                なし
+
+            Returns:
+                tuple[int, int, int, int, int] | None: stat() で取得したファイルの識別情報。欠損や不一致の場合は None
+            """
+            path = Path(video.file_path)
+            try:
+                before = path.stat()
+                if before.st_size != video.file_size:
+                    return None
+                identity = (before.st_dev, before.st_ino, before.st_size, before.st_mtime_ns, before.st_ctime_ns)
+                # 同じ内容なら録画スキャンは DB の更新日時を更新しない。初回はサイズとハッシュを照合し、
+                # 以後の更新日時の変化はセッションが保持する実ファイルの identity で検出する。
+                if verify_hash:
+                    if not MetadataAnalyzer(path).matchesFileHash(video.file_hash, raise_on_error=True):
+                        return None
+                    # 読み取ったハッシュと記録する識別情報を同じファイルのものにそろえる。
+                    after = path.stat()
+                    if identity != (after.st_dev, after.st_ino, after.st_size, after.st_mtime_ns, after.st_ctime_ns):
+                        return None
+                return identity
+            except FileNotFoundError:
+                return None
+
         # 照合中に GET が中断された場合も、想定内のファイル I/O 障害は照合タスク内で処理する。
         try:
-            file_identity = await self.runFileIO(partial(
-                self._getFileIdentity,
-                recorded_program.recorded_video,
-                verify_hash = self._file_identity is None,
-            ))
+            file_identity = await self.runFileIO(GetFileIdentity)
         except OSError as ex:
             logging.warning(f'[OfflineVideoSession] Failed to verify recording. [video_id: {self.info.video_id}]', exc_info=ex)
             return None
