@@ -763,11 +763,11 @@ class OfflineVideoSessionResponse(StreamingResponse):
         Returns:
             None
         """
-        # __call__() は接続を登録し、stream_response() は同じセッションから本文を取得する
+        # 応答の登録と本文の送信を担当する RAM 保存セッション
         self._session = session
-        # connect() が受理した接続番号。__call__() が登録を照合し、stream_response() が配信に使う
+        # connect() が受理し、応答登録時に照合する接続番号
         self._connection_id = connection_id
-        # connect() が受理した再送開始位置。stream_response() が配信に使う
+        # stream_response() が本文の送信を開始する位置
         self._next_sequence = next_sequence
         super().__init__(
             (),
@@ -787,8 +787,7 @@ class OfflineVideoSessionResponse(StreamingResponse):
         Returns:
             None
         """
-        is_started = False
-        is_finished = False
+        is_response_open = False
 
         async def TrackResponse(message: Message) -> None:
             """
@@ -800,13 +799,13 @@ class OfflineVideoSessionResponse(StreamingResponse):
             Returns:
                 None
             """
-            nonlocal is_started, is_finished
+            nonlocal is_response_open
             # send() が通信待ちに入る前に、応答開始を記録する。
             if message['type'] == 'http.response.start':
-                is_started = True
+                is_response_open = True
             await send(message)
             if message['type'] == 'http.response.body' and not message.get('more_body', False):
-                is_finished = True
+                is_response_open = False
 
         with CancelScope() as response_scope:
             # 応答開始前の引き継ぎや期限切れは、通常の API 例外ハンドラーに返す
@@ -823,7 +822,7 @@ class OfflineVideoSessionResponse(StreamingResponse):
                 self._session.unbindResponse(self._connection_id, response_scope)
 
         # 引き継ぎや失敗で中断した場合も、書きかけの HTTP 応答を可能な範囲で閉じる。
-        if response_scope.cancel_called and is_started and not is_finished:
+        if response_scope.cancel_called and is_response_open:
             try:
                 with move_on_after(1):
                     await send({'type': 'http.response.body', 'body': b'', 'more_body': False})

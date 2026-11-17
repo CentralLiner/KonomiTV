@@ -1115,9 +1115,14 @@ class VideoEncodingTask:
                                     if WriteAllToPipe(tsreadex_stdin_write, tsreadex_stdin_write_generation_token, chunk) is False:
                                         break
                             except BrokenPipeError:
+                                # RAM 保存のパイプ切断は WriteAllToPipe() が処理済みなので、ここでは入力側の異常を伝える。
+                                if offline_session is not None:
+                                    raise
                                 # tsreadex プロセスが終了した場合（正常なシャットダウン or エラー）
                                 pass
                             except OSError as ex:
+                                if offline_session is not None:
+                                    raise
                                 # キャンセル処理やリトライ処理でパイプを閉じた直後は、
                                 ## Linux / Windows ともに Invalid argument / Bad file descriptor が返ることがある
                                 if (
@@ -1131,8 +1136,6 @@ class VideoEncodingTask:
                                 ) and ex.errno in (errno.EBADF, errno.EINVAL):
                                     pass
                                 else:
-                                    if offline_session is not None:
-                                        raise
                                     logging.error(f'{self.video_stream.log_prefix} Error feeding data to tsreadex:', exc_info=ex)
                             except ValueError as ex:
                                 if offline_session is not None:
@@ -1536,20 +1539,15 @@ class VideoEncodingTask:
                             # 最初のフレームでアンカーを確定
                             if first_video_timestamp_33bit is None:
                                 first_video_timestamp_33bit = current_timestamp_33bit
-                                last_video_timestamp_33bit = current_timestamp_33bit
 
-                            # wrap-around 検出 (大きく逆行した場合のみ wrap とみなす)
-                            assert last_video_timestamp_33bit is not None
                             if offline_session is None:
-                                if current_timestamp_33bit < last_video_timestamp_33bit and (last_video_timestamp_33bit - current_timestamp_33bit) > (ts.PCR_CYCLE // 2):
+                                # 大きく逆行した場合のみ wrap とみなし、DB 上の単調増加 DTS に揃える。
+                                if last_video_timestamp_33bit is not None and last_video_timestamp_33bit - current_timestamp_33bit > ts.PCR_CYCLE // 2:
                                     wrap_offset_ticks += ts.PCR_CYCLE
                                 last_video_timestamp_33bit = current_timestamp_33bit
-
-                            # 単調増加となるよう展開した現在の DTS (DB 上の単調増加 DTS に揃える)
-                            assert first_video_timestamp_33bit is not None
-                            current_timestamp_unwrapped = first_segment_source_start_dts + (current_timestamp_33bit - first_video_timestamp_33bit + wrap_offset_ticks)
-                            presentation_timestamp = current_timestamp_unwrapped
-                            if offline_session is not None:
+                                current_timestamp_unwrapped = first_segment_source_start_dts + (current_timestamp_33bit - first_video_timestamp_33bit + wrap_offset_ticks)
+                                presentation_timestamp = current_timestamp_unwrapped
+                            else:
                                 # DTS のない出力では PTS が前後するため、33bit 境界の両方向を展開する。
                                 if offline_output_dts is None:
                                     offline_output_dts = current_timestamp_33bit
@@ -2005,7 +2003,7 @@ class VideoEncodingTask:
             logging.debug(f'{self.video_stream.log_prefix} Final cleanup completed.')
 
             if offline_session is None:
-                # キャンセルを検出したら、直ちに終了する。
+                # このエンコードタスクがキャンセルされている場合は何もしない
                 if self._is_cancelled is True:
                     return
 

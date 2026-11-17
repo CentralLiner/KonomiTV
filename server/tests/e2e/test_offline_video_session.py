@@ -43,6 +43,9 @@ def analyzed_recordings() -> dict[Path, schemas.RecordedProgram]:
     """
     同じ録画フィクスチャの解析結果をテスト間で再利用する。
 
+    Args:
+        なし
+
     Returns:
         dict[Path, schemas.RecordedProgram]: 元のファイルパスごとの解析結果
     """
@@ -135,7 +138,6 @@ def ReadSegments(body: bytes, *, first_sequence: int = 0) -> tuple[list[bytes], 
         offset += length
 
 
-@pytest.mark.asyncio
 @pytest.mark.parametrize('recording', [
     'terrestrial-bdav-partial-ts.m2ts',
     'terrestrial-tsreplace-h264.ts',
@@ -145,6 +147,16 @@ async def test_offline_video_session_replays_the_same_output(
     client: httpx.AsyncClient,
     recording: tuple[int, Path],
 ) -> None:
+    """
+    セッション作成と再接続を繰り返し、確定位置から同じデータを受信できることを確認する。
+
+    Args:
+        client (httpx.AsyncClient): テスト用 API クライアント
+        recording (tuple[int, Path]): 登録済み録画の ID とパス
+
+    Returns:
+        None
+    """
     video_id, _ = recording
     # 実出力が仮想プレイリストの終端を越える場合も検証する。
     await RecordedVideo.filter(recorded_program_id=video_id).update(duration=1.0)
@@ -187,7 +199,6 @@ async def test_offline_video_session_replays_the_same_output(
     assert (await client.delete(url, headers=headers)).status_code == 409
 
 
-@pytest.mark.asyncio
 async def test_offline_video_session_revalidates_recording_on_reconnect(
     client: httpx.AsyncClient,
     recording: tuple[int, Path],
@@ -259,7 +270,6 @@ async def test_offline_video_session_revalidates_recording_on_reconnect(
     assert changed.json()['detail']['code'] == 'recording_changed'
 
 
-@pytest.mark.asyncio
 async def test_offline_video_session_cancels_gets_waiting_for_recording_check(
     client: httpx.AsyncClient,
     recording: tuple[int, Path],
@@ -328,7 +338,6 @@ async def test_offline_video_session_cancels_gets_waiting_for_recording_check(
         await asyncio.gather(*requests, return_exceptions=True)
 
 
-@pytest.mark.asyncio
 @pytest.mark.parametrize(('quality', 'frame_rate', 'frame_count', 'wrap_dts'), [
     ('1080p-60fps', 60000, 361, False),
     ('720p', 30000, 181, True),
@@ -413,12 +422,22 @@ async def test_offline_video_session_keeps_final_boundary_frame_with_audio(
         assert 6000 <= duration_ms <= 6100
 
 
-@pytest.mark.asyncio
 async def test_offline_video_session_keeps_waiting_encoder_on_disconnect(
     client: httpx.AsyncClient,
     recording: tuple[int, Path],
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    """
+    実行枠を待つ間に切断された応答や送信中の旧応答から、新しい接続へ引き継げることを確認する。
+
+    Args:
+        client (httpx.AsyncClient): テスト用 API クライアント
+        recording (tuple[int, Path]): 登録済み録画の ID とパス
+        monkeypatch (pytest.MonkeyPatch): keepalive の間隔を短縮するために使用
+
+    Returns:
+        None
+    """
     from app.app import app
 
     monkeypatch.setattr(OfflineVideoSession, 'KEEPALIVE_INTERVAL', 0.05)
@@ -476,7 +495,6 @@ async def test_offline_video_session_keeps_waiting_encoder_on_disconnect(
     assert len(segments) == count >= 2
 
 
-@pytest.mark.asyncio
 async def test_offline_video_session_reconnects_while_waiting_for_capacity(
     client: httpx.AsyncClient,
     recording: tuple[int, Path],
@@ -591,7 +609,6 @@ async def test_offline_video_session_reconnects_while_waiting_for_capacity(
     assert (await client.delete(url, headers=headers)).status_code == 204
 
 
-@pytest.mark.asyncio
 async def test_offline_video_session_cancels_pipe_registration(
     client: httpx.AsyncClient,
     recording: tuple[int, Path],
@@ -658,7 +675,6 @@ async def test_offline_video_session_cancels_pipe_registration(
         await response_task
 
 
-@pytest.mark.asyncio
 async def test_offline_video_session_closes_input_pipe_on_cancel_during_cleanup(
     client: httpx.AsyncClient,
     recording: tuple[int, Path],
@@ -734,7 +750,6 @@ async def test_offline_video_session_closes_input_pipe_on_cancel_during_cleanup(
                 pass
 
 
-@pytest.mark.asyncio
 async def test_offline_video_session_sends_keepalive_during_final_validation(
     client: httpx.AsyncClient,
     recording: tuple[int, Path],
@@ -807,11 +822,20 @@ async def test_offline_video_session_sends_keepalive_during_final_validation(
         await response_task
 
 
-@pytest.mark.asyncio
 async def test_offline_video_session_legacy_stream(
     client: httpx.AsyncClient,
     recording: tuple[int, Path],
 ) -> None:
+    """
+    通常の録画再生でシークでき、Background Fetch 用の単一応答で正常終端まで取得できることを確認する。
+
+    Args:
+        client (httpx.AsyncClient): テスト用 API クライアント
+        recording (tuple[int, Path]): 登録済み録画の ID とパス
+
+    Returns:
+        None
+    """
     video_id, _ = recording
     base_url = f'/api/streams/video/{video_id}/240p'
     # プレイリスト取得前のセグメント要求でセッションが作られ、そこから先頭へシークできることを確認する。
@@ -830,7 +854,6 @@ async def test_offline_video_session_legacy_stream(
     segments, count = ReadSegments(response.content)
     assert len(segments) == count == 1
 
-@pytest.mark.asyncio
 @pytest.mark.parametrize(('phase', 'recording'), [
     ('Feed', 'terrestrial-bdav-partial-ts.m2ts'),
     ('Retry', 'terrestrial-bdav-partial-ts.m2ts'),
@@ -958,12 +981,22 @@ async def test_offline_video_session_releases_slot_during_input_read(
         default_executor.shutdown(wait=True)
 
 
-@pytest.mark.asyncio
 async def test_offline_video_session_capacity_and_recording_change(
     client: httpx.AsyncClient,
     recording: tuple[int, Path],
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    """
+    登録数の上限と期限切れによる回収、初回の接続前に変更された録画の拒否を確認する。
+
+    Args:
+        client (httpx.AsyncClient): テスト用 API クライアント
+        recording (tuple[int, Path]): 登録済み録画の ID とパス
+        monkeypatch (pytest.MonkeyPatch): セッションの有効期限を短縮するために使用
+
+    Returns:
+        None
+    """
     video_id, path = recording
     base_url = f'/api/streams/video/{video_id}/720p/offline-sessions'
     urls = [f'{base_url}/{uuid.uuid4().hex}' for _ in range(4)]
@@ -993,8 +1026,13 @@ async def test_offline_video_session_capacity_and_recording_change(
     assert error.json()['detail']['code'] == 'recording_changed'
 
 
-@pytest.mark.asyncio
-@pytest.mark.parametrize('failure', ['InitialProbe', 'RetryLimit', 'AfterPublication', 'InputProgrammingError'])
+@pytest.mark.parametrize('failure', [
+    'InitialProbe',
+    'RetryLimit',
+    'AfterPublication',
+    'InputProgrammingError',
+    'InputBrokenPipe',
+])
 async def test_offline_video_session_retries_probe_only_before_publication(
     client: httpx.AsyncClient,
     recording: tuple[int, Path],
@@ -1002,7 +1040,7 @@ async def test_offline_video_session_retries_probe_only_before_publication(
     failure: str,
 ) -> None:
     """
-    公開前の解析失敗を再試行し、実装上の例外と公開後の失敗ではセッションを終了する。
+    公開前の解析失敗を再試行し、入力処理の例外と公開後の失敗ではセッションを終了する。
 
     Args:
         client (httpx.AsyncClient): テスト用 API クライアント
@@ -1049,13 +1087,15 @@ async def test_offline_video_session_retries_probe_only_before_publication(
     monkeypatch.setattr(VideoEncodingTask, 'buildFFmpegOptions', BuildWithProbeFailure)
     monkeypatch.setattr(OfflineVideoSession, 'publishSegment', TrackPublication)
     monkeypatch.setattr(OfflineVideoSession, 'waitForCapacity', WaitAfterEarlyExit)
-    if failure == 'InputProgrammingError':
+    if failure in ('InputProgrammingError', 'InputBrokenPipe'):
         def FailInputCollection(_collector: TSKeyFrameCollector, _chunk: bytes, _chunk_file_offset: int) -> None:
             nonlocal input_failures
             input_failures += 1
+            if failure == 'InputBrokenPipe':
+                raise BrokenPipeError(errno.EPIPE, 'Recording input failed')
             raise TypeError('Unexpected error in input keyframe collection')
 
-        # 実録画の入力を最初のチャンクで止め、FFmpeg が映像・音声を出力する前の実装上の例外を再現する。
+        # 実録画の入力を最初のチャンクで止め、FFmpeg が映像・音声を出力する前の入力処理の例外を再現する。
         monkeypatch.setattr(TSKeyFrameCollector, 'push', FailInputCollection)
     video_id, _ = recording
     url = f'/api/streams/video/{video_id}/240p/offline-sessions/{uuid.uuid4().hex}'
@@ -1066,7 +1106,7 @@ async def test_offline_video_session_retries_probe_only_before_publication(
     response = await client.get(f'{url}?connection_id=1&next_sequence=0', headers=headers)
     assert response.status_code == 200
     assert len(probe_durations) == (2 if failure in ('InitialProbe', 'RetryLimit') else 1)
-    if failure == 'InputProgrammingError':
+    if failure in ('InputProgrammingError', 'InputBrokenPipe'):
         assert input_failures == 1
     if len(probe_durations) == 2:
         assert probe_durations[1] > probe_durations[0]
@@ -1086,7 +1126,6 @@ async def test_offline_video_session_retries_probe_only_before_publication(
             pass
 
 
-@pytest.mark.asyncio
 async def test_offline_video_session_cancels_encoder_retry(
     client: httpx.AsyncClient,
     recording: tuple[int, Path],
@@ -1166,7 +1205,6 @@ async def test_offline_video_session_cancels_encoder_retry(
         await asyncio.wait_for(response_task, timeout=5)
 
 
-@pytest.mark.asyncio
 @pytest.mark.parametrize(('failure', 'recording'), [
     ('PartialPacket', 'terrestrial-bdav-partial-ts.m2ts'),
     ('IncompletePES', 'terrestrial-bdav-partial-ts.m2ts'),
