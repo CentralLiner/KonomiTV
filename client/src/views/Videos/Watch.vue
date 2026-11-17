@@ -7,6 +7,7 @@ import { mapStores } from 'pinia';
 import { defineComponent } from 'vue';
 
 import Watch from '@/components/Watch/Watch.vue';
+import Message from '@/message';
 import OfflineVideos from '@/services/OfflineVideos';
 import PlayerController from '@/services/player/PlayerController';
 import Videos from '@/services/Videos';
@@ -60,14 +61,15 @@ export default defineComponent({
         // 再生セッションを初期化する
         async init() {
 
+            const route = this.$route;
             // URL 上の録画番組 ID が未定義なら実行しない (フェイルセーフ)
             // 基本あり得ないはずだが、念のため
-            if (this.$route.params.video_id === undefined) {
+            if (route.params.video_id === undefined) {
                 this.$router.push({path: '/not-found/'});
                 return;
             }
 
-            const video_id_text = this.$route.params.video_id;
+            const video_id_text = route.params.video_id;
             if (typeof video_id_text !== 'string' || /^[1-9]\d*$/.test(video_id_text) === false) {
                 this.$router.push({path: '/not-found/'});
                 return;
@@ -75,10 +77,20 @@ export default defineComponent({
             const video_id = Number(video_id_text);
 
             // オフライン保存ページから開いた場合は保存時点の番組情報を使い、通常再生の通信失敗時だけ保存版へ切り替える
-            let offline_video = this.$route.query.source === 'offline' ? await OfflineVideos.getVideo(video_id) : null;
+            const { source, generation } = route.query;
+            let offline_video = source === 'offline' ? await OfflineVideos.getVideo(video_id) : null;
+            if (this.$route !== route) return;
+            // 表示時の保存世代が削除・置換された場合は、一覧を開き直すよう案内する。
+            if (source === 'offline' && generation !== undefined && offline_video?.generation_id !== generation) {
+                Message.error('このオフライン保存は端末にありません。一覧から開き直してください。');
+                this.$router.replace({path: '/offline-videos/'});
+                return;
+            }
             let recorded_program = offline_video?.program ?? await Videos.fetchVideo(video_id);
+            if (this.$route !== route) return;
             if (recorded_program === null && offline_video === null) {
                 offline_video = await OfflineVideos.getVideo(video_id);
+                if (this.$route !== route) return;
                 recorded_program = offline_video?.program ?? null;
             }
             if (recorded_program === null) {

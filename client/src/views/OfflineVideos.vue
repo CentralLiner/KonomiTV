@@ -79,26 +79,22 @@ let isRefreshingActiveProgress = false;
 let needsRefresh = false;
 
 const activeJobs = computed(() => jobs.value.filter(job => ['Waiting', 'Downloading', 'Finalizing'].includes(job.state)));
-const visibleOfflineJobs = computed(() => jobs.value.filter(job =>
-    ['Waiting', 'Downloading', 'Finalizing', 'Failed'].includes(job.state),
-));
+const visibleOfflineJobs = computed(() => {
+    // 保存済み動画の欠損で同じ録画 ID に失敗ジョブが増えても、進行中の保存を操作できるようにする。
+    const activeVideoIDs = new Set(activeJobs.value.map(job => job.video_id));
+    return jobs.value.filter(job => ['Waiting', 'Downloading', 'Finalizing'].includes(job.state) ||
+        (job.state === 'Failed' && !activeVideoIDs.has(job.video_id)));
+});
 const savedSizeBytes = computed(() => videos.value.reduce((total, video) => total + video.size_bytes, 0));
 
 /** 保存済み動画と保存ジョブを1つの一覧へ統合する */
 const displayPrograms = computed((): IRecordedProgram[] => {
-    const programs: IRecordedProgram[] = [];
-    const jobsByVideoID = new Map<number, IOfflineDownloadJob>();
-
-    // 実行中・失敗のジョブを先頭へ並べ、同じ番組の二重表示を防ぐ
-    for (const job of visibleOfflineJobs.value) {
-        if (jobsByVideoID.has(job.video_id)) continue;
-        jobsByVideoID.set(job.video_id, job);
-        programs.push(job.program);
-    }
+    const visibleJobs = visibleOfflineJobs.value;
+    // 保存世代の欠損と保存処理の失敗は、各ジョブから個別に再試行・削除できるようにする。
+    const programs = visibleJobs.map(job => job.program);
     for (const video of videos.value) {
         // 録画 ID が別の番組に再利用された場合は、保存済み動画を独立した行から再生できるようにする。
-        const job = jobsByVideoID.get(video.video_id);
-        if (job !== undefined && OfflineVideos.isSameRecording(video.program, job.program)) continue;
+        if (visibleJobs.some(job => job.video_id === video.video_id && OfflineVideos.isSameRecording(video.program, job.program))) continue;
         programs.push(video.program);
     }
     return programs;

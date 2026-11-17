@@ -220,6 +220,8 @@ stateDiagram-v2
 
 削除は操作列の右端の赤色アイコンとし、Vuetifyの確認ダイアログを使用する。対象ジョブを開いた時点で固定し、表示更新で別ジョブへ操作しない。既存の保存済み動画を残すことが分かる文言にする。画面の変更は `mixin.scss` の全画面サイズで確認する。
 
+保存済み動画のリンクは一覧に表示した保存世代を視聴画面へ渡す。別タブでその世代が置き換わった場合は、一覧を開き直すよう案内する。保存済み動画の行からサーバー上の録画ファイルを削除する場合は、確認対象のパスとハッシュを最新の録画情報と照合する。
+
 ## 実装の分割
 
 1. **一覧からの先頭再試行**：クライアントの再試行操作、失敗ジョブのclaim、保存開始前の付随データ取得のキャンセル、削除確認、保存済み動画の保護。通常Fetch・Background Fetchの両方を確認する。
@@ -240,6 +242,7 @@ APIを追加して利用する変更はサーバーのコミットを先、ク�
 | `server/app/app.py` | shutdown時のセッション回収 |
 | `client/src/services/OfflineVideos.ts`、`OfflineVideoStorage.ts` | 同一ジョブの自動再接続、手動再試行、既存世代の保護 |
 | `client/src/components/Videos/RecordedProgram.vue`、`RecordedProgramList.vue`、`views/OfflineVideos.vue` | 再試行イベントと状態表示、確認ダイアログ |
+| `client/src/views/Videos/Watch.vue` | オフライン保存一覧から指定された保存世代の確認 |
 
 ## 受け入れ条件
 

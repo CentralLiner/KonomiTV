@@ -198,16 +198,10 @@ const handleProgramDeleted = (id: number) => {
     displayTotal.value--;
 };
 
-/** 一覧に表示する保存ジョブを取得する */
-const getOfflineDownloadJob = (program: IRecordedProgram): IOfflineDownloadJob | null => {
-    return props.offlineJobs?.find(job =>
-        job.video_id === program.id && (job.program === program || OfflineVideos.isSameRecording(job.program, program)),
-    ) ?? null;
-};
-
 const displayProgramEntries = computed(() => displayPrograms.value.map(program => ({
     program,
-    job: getOfflineDownloadJob(program),
+    // 番組が同じでも、一覧へ行を追加した保存ジョブを操作対象にする。
+    job: props.offlineJobs?.find(job => job.program === program) ?? null,
     video: props.offlineVideos?.find(video =>
         video.video_id === program.id && (video.program === program || OfflineVideos.isSameRecording(video.program, program)),
     ) ?? null,
