@@ -138,6 +138,59 @@ def ReadSegments(body: bytes, *, first_sequence: int = 0) -> tuple[list[bytes], 
         offset += length
 
 
+async def test_offline_recording_delete_checks_confirmed_file(
+    client: httpx.AsyncClient,
+    recording: tuple[int, Path],
+    admin_headers: dict[str, str],
+) -> None:
+    """
+    オフライン保存一覧で確認したファイルのパスとハッシュが一致する場合だけ削除する。
+
+    Args:
+        client (httpx.AsyncClient): テスト用 API クライアント
+        recording (tuple[int, Path]): 現在の録画番組の ID とファイルパス
+        admin_headers (dict[str, str]): 管理者として API を呼び出すためのヘッダー
+    Returns:
+        None
+    """
+
+    video_id, path = recording
+    url = f'/api/videos/{video_id}'
+    response = await client.get(url)
+    assert response.status_code == 200, response.text
+    file_hash = response.json()['recorded_video']['file_hash']
+    confirmed_file = {'file_path': str(path), 'file_hash': file_hash}
+
+    # 移動や録画 ID の再利用前に確認した情報で削除を要求しても、現在の録画は残る。
+    for expected_path, expected_hash in [(str(path.with_name('other.ts')), file_hash), (str(path), 'different-hash')]:
+        response = await client.request(
+            'DELETE',
+            url,
+            headers = admin_headers,
+            json = {'file_path': expected_path, 'file_hash': expected_hash},
+        )
+        assert response.status_code == 409, response.text
+        assert response.json()['detail'] == 'The confirmed recording file is no longer available.'
+        assert path.is_file()
+        assert (await client.get(url)).status_code == 200
+
+    # 再解析に失敗した直後は、DB のパスとハッシュが確認時と同じでも現在の録画を削除できない。
+    await RecordedVideo.filter(recorded_program_id=video_id).update(status='AnalysisFailed')
+    response = await client.request('DELETE', url, headers=admin_headers, json=confirmed_file)
+    assert response.status_code == 409, response.text
+    assert path.is_file()
+    await RecordedVideo.filter(recorded_program_id=video_id).update(status='Recorded')
+
+    response = await client.request(
+        'DELETE',
+        url,
+        headers = admin_headers,
+        json = confirmed_file,
+    )
+    assert response.status_code == 204, response.text
+    assert path.exists() is False
+
+
 @pytest.mark.parametrize('recording', [
     'terrestrial-bdav-partial-ts.m2ts',
     'terrestrial-tsreplace-h264.ts',
@@ -174,7 +227,8 @@ async def test_offline_video_session_replays_the_same_output(
     assert len(segments) == count >= 2
     assert all(segment.startswith(b'\x47') for segment in segments)
     recorded_video = await RecordedVideo.get(recorded_program_id=video_id)
-    assert all(entry['sequence_index'] == 0 for entry in recorded_video.segment_map)
+    expected_sequences = [0] if recorded_video.container_format == 'MPEG-TS' else []
+    assert [entry['sequence_index'] for entry in recorded_video.segment_map] == expected_sequences
 
     replay = await client.get(f'{url}?connection_id=2&next_sequence=1', headers=headers)
     assert replay.status_code == 200
@@ -300,6 +354,68 @@ async def test_offline_video_session_revalidates_recording_on_reconnect(
     changed = await client.get(f'{url}?connection_id=6&next_sequence={count}', headers=headers)
     assert changed.status_code == 409
     assert changed.json()['detail']['code'] == 'recording_changed'
+
+
+@pytest.mark.parametrize('change_target', ['File', 'Database'])
+async def test_offline_video_session_preserves_segment_map_when_recording_changes(
+    client: httpx.AsyncClient,
+    recording: tuple[int, Path],
+    monkeypatch: pytest.MonkeyPatch,
+    change_target: str,
+) -> None:
+    """
+    エンコード前やシーク位置の保存時に録画が変わった場合、以前の録画のシーク位置を登録から除外する。
+
+    Args:
+        client (httpx.AsyncClient): テスト用 API クライアント
+        recording (tuple[int, Path]): 登録済みの M2TS 録画の ID とパス
+        monkeypatch (pytest.MonkeyPatch): 照合が済んだ最初の GET を検知するために使用
+        change_target (str): 実ファイルまたは DB の変更を再現する対象
+
+    Returns:
+        None
+    """
+    video_id, path = recording
+    assert (await RecordedVideo.get(recorded_program_id=video_id)).segment_map == []
+    url = f'/api/streams/video/{video_id}/240p/offline-sessions/{uuid.uuid4().hex}'
+    created = await client.put(url)
+    assert created.status_code == 201
+    headers = {'X-KonomiTV-Offline-Generation': created.json()['generation_token']}
+    started = asyncio.Event()
+    original_stream = OfflineVideoSession.stream
+
+    async def TrackStream(session: OfflineVideoSession, connection_id: int, next_sequence: int, send: Send) -> None:
+        started.set()
+        await original_stream(session, connection_id, next_sequence, send)
+
+    original_matches = OfflineVideoSession.matchesRecording
+
+    async def MatchThenUpdateRecording(session: OfflineVideoSession) -> bool | None:
+        matches = await original_matches(session)
+        if matches is True:
+            # 照合の直後にスキャンが同じ ID の録画情報を更新する。
+            await RecordedVideo.filter(recorded_program_id=video_id).update(file_hash='replacement', segment_map=[])
+        return matches
+
+    monkeypatch.setattr(OfflineVideoSession, 'stream', TrackStream)
+    async with OFFLINE_VIDEO_STREAM_SEMAPHORE, OFFLINE_VIDEO_STREAM_SEMAPHORE, OFFLINE_VIDEO_STREAM_SEMAPHORE:
+        response_task = asyncio.create_task(client.get(f'{url}?connection_id=1&next_sequence=0', headers=headers))
+        await asyncio.wait_for(started.wait(), timeout=5)
+        if change_target == 'Database':
+            monkeypatch.setattr(OfflineVideoSession, 'matchesRecording', MatchThenUpdateRecording)
+        else:
+            # サイズを保ちつつキーフレームの位置がずれるよう、先頭の M2TS パケットを複製して末尾の1個を除く。
+            original = path.read_bytes()
+            stat = path.stat()
+            packet_size = 192
+            path.write_bytes(original[:packet_size] + original[:-packet_size])
+            os.utime(path, ns=(stat.st_atime_ns, stat.st_mtime_ns + 5_000_000_000))
+
+    response = await asyncio.wait_for(response_task, timeout=30)
+    assert response.status_code == 200
+    with pytest.raises(struct.error):
+        ReadSegments(response.content)
+    assert (await RecordedVideo.get(recorded_program_id=video_id)).segment_map == []
 
 
 async def test_offline_video_session_cancels_gets_waiting_for_recording_check(
@@ -819,17 +935,22 @@ async def test_offline_video_session_sends_keepalive_during_final_validation(
 
         # GET の照合が済んだ時点で、正常終端の公開前の照合に待ち時間を入れる。
         with monkeypatch.context() as patch:
-            patch.setattr(OfflineVideoSession, '_matchesRecording', CheckWithDelay)
+            patch.setattr(OfflineVideoSession, 'matchesRecording', CheckWithDelay)
             await original_stream(session, connection_id, next_sequence, TrackSend)
 
-    monkeypatch.setattr(OfflineVideoSession, 'stream', TrackStream)
-    monkeypatch.setattr(OfflineVideoSession, 'KEEPALIVE_INTERVAL', 0.02)
     video_id, _ = recording
     url = f'/api/streams/video/{video_id}/240p/offline-sessions/{uuid.uuid4().hex}'
     created = await client.put(url)
     assert created.status_code == 201
     headers = {'X-KonomiTV-Offline-Generation': created.json()['generation_token']}
-    response_task = asyncio.create_task(client.get(f'{url}?connection_id=1&next_sequence=0', headers=headers))
+    # 先に変換を完了させ、シーク位置の保存を済ませてから終端だけを再取得する。
+    response = await client.get(f'{url}?connection_id=1&next_sequence=0', headers=headers)
+    assert response.status_code == 200
+    segments, count = ReadSegments(response.content)
+    assert len(segments) == count > 0
+    monkeypatch.setattr(OfflineVideoSession, 'stream', TrackStream)
+    monkeypatch.setattr(OfflineVideoSession, 'KEEPALIVE_INTERVAL', 0.02)
+    response_task = asyncio.create_task(client.get(f'{url}?connection_id=2&next_sequence={count}', headers=headers))
     try:
         await asyncio.wait_for(checking.wait(), 10)
         await asyncio.wait_for(keepalive.wait(), 1)
@@ -837,16 +958,15 @@ async def test_offline_video_session_sends_keepalive_during_final_validation(
         release.set()
         response = await asyncio.wait_for(response_task, 5)
         assert response.status_code == 200
-        segments, count = ReadSegments(response.content)
-        assert len(segments) == count > 0
+        assert ReadSegments(response.content, first_sequence=count) == ([], count)
 
         # 再接続時の照合は通し、終端を公開する直前の照合で実装上の例外を発生させる。
         fail_check = True
-        response = await client.get(f'{url}?connection_id=2&next_sequence={count}', headers=headers)
+        response = await client.get(f'{url}?connection_id=3&next_sequence={count}', headers=headers)
         assert response.status_code == 200
         with pytest.raises(struct.error):
             ReadSegments(response.content, first_sequence=count)
-        response = await client.get(f'{url}?connection_id=3&next_sequence={count}', headers=headers)
+        response = await client.get(f'{url}?connection_id=4&next_sequence={count}', headers=headers)
         assert response.status_code == 410
     finally:
         release.set()

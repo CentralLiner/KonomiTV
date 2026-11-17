@@ -705,6 +705,10 @@ class VideoStream:
         if len(segment_map_entries) == 0:
             return
 
+        # RAM 保存では、今回探索した位置がセッション作成時の録画に対応する場合だけ保存する。
+        if self.offline_session is not None and await self.offline_session.matchesRecording() is not True:
+            return
+
         try:
             # セッション生成時に受け取った ORM インスタンスへ、保存後の最新 JSON を反映する
             ## 実際のマージは DB から読み直した RecordedVideo に対して行う
@@ -732,6 +736,9 @@ class VideoStream:
                     latest_recorded_video = await RecordedVideo.select_for_update().get_or_none(id=recorded_video.id)
                     if latest_recorded_video is None:
                         logging.warning(f'{self.log_prefix} RecordedVideo was not found while saving segment map entries.')
+                        return
+                    # 録画スキャンが照合後に同じレコードを更新した場合は、スキャン後の値を保持する。
+                    if self.offline_session is not None and not self.offline_session.matchesRecordedVideo(latest_recorded_video):
                         return
 
                     # DB から読み直した最新の segment_map をベースに、今回の候補をマージしていく

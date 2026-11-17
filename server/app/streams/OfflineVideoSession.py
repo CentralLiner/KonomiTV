@@ -5,7 +5,6 @@ import secrets
 import struct
 from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
-from datetime import datetime
 from pathlib import Path
 from typing import ClassVar
 
@@ -85,11 +84,11 @@ class OfflineVideoSession:
         """
         # create() が登録に使い、_cleanup() が回収時に取り除く保存 ID
         self.session_id = session_id
-        # _matchesRecording() の照合基準となる作成時の録画情報。_encode() が同じ録画を入力に使う
+        # matchesRecording() の照合基準となる作成時の録画情報。_encode() が同じ録画を入力に使う
         self._recorded_program = recorded_program
         # _encode() が使用する検証済みの画質と追加オプション
         self._stream_quality = stream_quality
-        # _matchesRecording() が最初の GET で記録し、以後の接続と正常終端で比較するファイルの識別情報
+        # matchesRecording() が最初の GET で記録し、以後の接続・シーク位置の保存・正常終端で比較するファイルの識別情報
         self._file_identity: tuple[int, int, int, int, int] | None = None
         # connect() が並行 GET で共有する録画照合タスク。close() が待機中の照合を中断する
         self._connection_recording_check: asyncio.Task[bool | None] | None = None
@@ -164,7 +163,7 @@ class OfflineVideoSession:
         existing = cls._sessions.get(session_id)
         if existing is not None:
             existing._validateTarget(recorded_program.id, quality)
-            if existing._recordingFields(recorded_video) != existing._recordingFields(existing._recorded_program.recorded_video):
+            if not existing.matchesRecordedVideo(recorded_video):
                 raise OfflineVideoSessionError(409, 'recording_changed')
             if existing.is_closed:
                 raise OfflineVideoSessionError(429, 'session_capacity', retry_after=5)
@@ -519,6 +518,83 @@ class OfflineVideoSession:
         if self._connection_id == connection_id and self._response_scope is scope:
             self._response_scope = None
 
+    def matchesRecordedVideo(self, video: RecordedVideo) -> bool:
+        """
+        現在の DB レコードが保存セッションの録画に対応するかを確認する。
+
+        Args:
+            video (RecordedVideo): 照合対象の録画ファイルの DB レコード
+
+        Returns:
+            bool: 保存可能な状態で、セッション作成時と同じ録画なら True
+        """
+        original = self._recorded_program.recorded_video
+        return (
+            video.status in ('Recorded', 'AnalysisFailed') and
+            video.id == original.id and
+            video.file_path == original.file_path and
+            video.file_hash == original.file_hash and
+            video.file_size == original.file_size and
+            video.file_modified_at == original.file_modified_at
+        )
+
+    async def matchesRecording(self) -> bool | None:
+        """
+        現在の録画情報と実ファイルをセッション作成時の録画と照合する。
+
+        Args:
+            なし
+
+        Returns:
+            bool | None: 録画が一致すれば True、変更されていれば False、一時的な I/O 障害なら None
+        """
+        recorded_program = await RecordedProgram.filter(id=self.info.video_id).get_or_none().select_related('recorded_video')
+        if recorded_program is None or not self.matchesRecordedVideo(recorded_program.recorded_video):
+            return False
+        video = recorded_program.recorded_video
+        verify_hash = self._file_identity is None
+
+        def GetFileIdentity() -> tuple[int, int, int, int, int] | None:
+            """
+            DB に登録された録画に対応する実ファイルの識別情報を取得する。
+
+            Args:
+                なし
+
+            Returns:
+                tuple[int, int, int, int, int] | None: stat() で取得したファイルの識別情報。欠損や不一致の場合は None
+            """
+            path = Path(video.file_path)
+            try:
+                before = path.stat()
+                if before.st_size != video.file_size:
+                    return None
+                identity = (before.st_dev, before.st_ino, before.st_size, before.st_mtime_ns, before.st_ctime_ns)
+                # 同じ内容なら録画スキャンは DB の更新日時を更新しない。初回はサイズとハッシュを照合し、
+                # 以後の更新日時の変化はセッションが保持する実ファイルの identity で検出する。
+                if verify_hash:
+                    if not MetadataAnalyzer(path).matchesFileHash(video.file_hash, raise_on_error=True):
+                        return None
+                    # 読み取ったハッシュと記録する識別情報を同じファイルのものにそろえる。
+                    after = path.stat()
+                    if identity != (after.st_dev, after.st_ino, after.st_size, after.st_mtime_ns, after.st_ctime_ns):
+                        return None
+                return identity
+            except FileNotFoundError:
+                return None
+
+        # 照合中に GET が中断された場合も、想定内のファイル I/O 障害は照合タスク内で処理する。
+        try:
+            file_identity = await self.runFileIO(GetFileIdentity)
+        except OSError as ex:
+            logging.warning(f'[OfflineVideoSession] Failed to verify recording. [video_id: {self.info.video_id}]', exc_info=ex)
+            return None
+        if file_identity is None:
+            return False
+        if self._file_identity is None:
+            self._file_identity = file_identity
+        return self._file_identity == file_identity
+
     def _validateTarget(self, video_id: int, quality: str) -> None:
         """
         要求した録画と画質が、登録されたセッションと一致することを確認する。
@@ -601,19 +677,6 @@ class OfflineVideoSession:
         data, _ = self._retained.pop(sequence)
         self._retained_bytes -= len(data)
 
-    @staticmethod
-    def _recordingFields(video: RecordedVideo) -> tuple[int, str, str, int, datetime]:
-        """
-        セッションの作成時から変化していないことを確認する録画の属性を取り出す。
-
-        Args:
-            video (RecordedVideo): 照合対象の録画ファイルの DB レコード
-
-        Returns:
-            tuple[int, str, str, int, datetime]: 録画ファイルの ID・パス・ハッシュ・サイズ・更新日時
-        """
-        return video.id, video.file_path, video.file_hash, video.file_size, video.file_modified_at
-
     def _startRecordingCheck(self) -> asyncio.Task[bool | None]:
         """
         録画照合を開始し、想定外の例外が起きた場合は保存セッションを終了する。
@@ -641,68 +704,9 @@ class OfflineVideoSession:
                 logging.error(f'[OfflineVideoSession] Recording verification failed. [video_id: {self.info.video_id}]', exc_info=error)
                 self.close()
 
-        task = asyncio.create_task(self._matchesRecording())
+        task = asyncio.create_task(self.matchesRecording())
         task.add_done_callback(FinishRecordingCheck)
         return task
-
-    async def _matchesRecording(self) -> bool | None:
-        """
-        現在の録画情報と実ファイルをセッション作成時の録画と照合する。
-
-        Args:
-            なし
-
-        Returns:
-            bool | None: 録画が一致すれば True、変更されていれば False、一時的な I/O 障害なら None
-        """
-        recorded_program = await RecordedProgram.filter(id=self.info.video_id).get_or_none().select_related('recorded_video')
-        if recorded_program is None or recorded_program.recorded_video.status not in ('Recorded', 'AnalysisFailed'):
-            return False
-        video = recorded_program.recorded_video
-        if self._recordingFields(video) != self._recordingFields(self._recorded_program.recorded_video):
-            return False
-        verify_hash = self._file_identity is None
-
-        def GetFileIdentity() -> tuple[int, int, int, int, int] | None:
-            """
-            DB に登録された録画に対応する実ファイルの識別情報を取得する。
-
-            Args:
-                なし
-
-            Returns:
-                tuple[int, int, int, int, int] | None: stat() で取得したファイルの識別情報。欠損や不一致の場合は None
-            """
-            path = Path(video.file_path)
-            try:
-                before = path.stat()
-                if before.st_size != video.file_size:
-                    return None
-                identity = (before.st_dev, before.st_ino, before.st_size, before.st_mtime_ns, before.st_ctime_ns)
-                # 同じ内容なら録画スキャンは DB の更新日時を更新しない。初回はサイズとハッシュを照合し、
-                # 以後の更新日時の変化はセッションが保持する実ファイルの identity で検出する。
-                if verify_hash:
-                    if not MetadataAnalyzer(path).matchesFileHash(video.file_hash, raise_on_error=True):
-                        return None
-                    # 読み取ったハッシュと記録する識別情報を同じファイルのものにそろえる。
-                    after = path.stat()
-                    if identity != (after.st_dev, after.st_ino, after.st_size, after.st_mtime_ns, after.st_ctime_ns):
-                        return None
-                return identity
-            except FileNotFoundError:
-                return None
-
-        # 照合中に GET が中断された場合も、想定内のファイル I/O 障害は照合タスク内で処理する。
-        try:
-            file_identity = await self.runFileIO(GetFileIdentity)
-        except OSError as ex:
-            logging.warning(f'[OfflineVideoSession] Failed to verify recording. [video_id: {self.info.video_id}]', exc_info=ex)
-            return None
-        if file_identity is None:
-            return False
-        if self._file_identity is None:
-            self._file_identity = file_identity
-        return self._file_identity == file_identity
 
     async def _encode(self) -> None:
         """

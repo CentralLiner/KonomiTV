@@ -1186,6 +1186,7 @@ async def VideoThumbnailRegenerateAPI(
 async def VideoDeleteAPI(
     recorded_program: Annotated[RecordedProgram, Depends(GetRecordedProgram)],
     current_user: Annotated[User, Depends(GetCurrentAdminUser)],
+    body: schemas.VideoDeleteRequest | None = None,
 ):
     """
     指定された録画番組のファイルとメタデータを削除する。不可逆な処理であるため、慎重に実行すること。
@@ -1195,11 +1196,13 @@ async def VideoDeleteAPI(
     - 録画ファイル本体を削除
 
     JWT エンコードされたアクセストークンがリクエストの Authorization: Bearer に設定されていて、かつ管理者アカウントでないとアクセスできない。
+    確認時のファイルパスとハッシュを指定した場合は、現在の録画ファイルに一致し、録画が完了している場合に限り削除する。
     """
 
     # 録画ファイルの情報を取得
-    file_path = anyio.Path(recorded_program.recorded_video.file_path)
-    file_hash = recorded_program.recorded_video.file_hash
+    recorded_video = recorded_program.recorded_video
+    file_path = anyio.Path(recorded_video.file_path)
+    file_hash = recorded_video.file_hash
     file_name = file_path.name
     file_dir = file_path.parent
 
@@ -1214,13 +1217,29 @@ async def VideoDeleteAPI(
             ).exclude(id=recorded_program.id).count()
             has_duplicates = duplicate_records > 0
 
-            # データベースから録画番組情報を削除
-            await recorded_program.delete()
+            # オフライン一覧で確認したファイルは、対象の読込時と DB レコードを削除する時点で照合する。
+            # 再解析に失敗した録画には前回のハッシュが残るため、現在の解析結果がある録画を対象にする。
+            deleted_count = 0
+            if body is None:
+                await recorded_program.delete()
+            elif body.file_path == recorded_video.file_path and body.file_hash == file_hash:
+                deleted_count = await RecordedProgram.filter(
+                    id = recorded_program.id,
+                    recorded_video__file_path = body.file_path,
+                    recorded_video__file_hash = body.file_hash,
+                    recorded_video__status = 'Recorded',
+                ).delete()
         except Exception as ex:
             logging.error('[VideoDeleteAPI] Failed to delete recorded program from database:', exc_info=ex)
             raise HTTPException(
                 status_code = status.HTTP_500_INTERNAL_SERVER_ERROR,
                 detail = f'Failed to delete recorded program from database: {ex!s}',
+            )
+
+        if body is not None and deleted_count == 0:
+            raise HTTPException(
+                status_code = status.HTTP_409_CONFLICT,
+                detail = 'The confirmed recording file is no longer available.',
             )
 
         # 2. サムネイルファイルの削除
@@ -1299,6 +1318,9 @@ async def VideoDeleteAPI(
             logging.warning(f'[VideoDeleteAPI] Recorded video file does not exist: {file_path}')
 
     except Exception as ex:
+        # 確認した録画が対象外になったときは、一覧から確認し直せるよう競合を返す。
+        if isinstance(ex, HTTPException) and ex.status_code == status.HTTP_409_CONFLICT:
+            raise
         logging.error('[VideoDeleteAPI] Failed to delete recorded program:', exc_info=ex)
         raise HTTPException(
             status_code = status.HTTP_500_INTERNAL_SERVER_ERROR,

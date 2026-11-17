@@ -220,7 +220,7 @@ stateDiagram-v2
 
 削除は操作列の右端の赤色アイコンとし、Vuetifyの確認ダイアログを使用する。対象ジョブを開いた時点で固定し、表示更新で別ジョブへ操作しない。既存の保存済み動画を残すことが分かる文言にする。画面の変更は `mixin.scss` の全画面サイズで確認する。
 
-保存済み動画のリンクは一覧に表示した保存世代を視聴画面へ渡す。別タブでその世代が置き換わった場合は、一覧を開き直すよう案内する。保存済み動画の行からサーバー上の録画ファイルを削除する場合は、確認対象のパスとハッシュを最新の録画情報と照合する。
+保存済み動画のリンクは一覧に表示した保存世代を視聴画面へ渡す。別タブでその世代が置き換わった場合は、一覧を開き直すよう案内する。保存済み動画の行からサーバー上の録画ファイルを削除する場合は、確認対象のパスとハッシュを `DELETE /api/videos/{video_id}` の本文で渡す。サーバーは同じリクエスト内で対象の取得時とDBレコードの削除時に照合する。現在の解析結果がある録画 (`Recorded`) に限って削除する。
 
 ## 実装の分割
 
@@ -238,6 +238,7 @@ APIを追加して利用する変更はサーバーのコミットを先、ク�
 | `server/app/streams/OfflineVideoSession.py` 新規 | RAMセッションの所有権・ACK・容量・期限・接続引き継ぎ |
 | `server/app/metadata/MetadataAnalyzer.py` | 既存の録画ハッシュ照合で発生した I/O エラーを RAM セッションの呼び出し元へ伝える |
 | `server/app/routers/VideoStreamsRouter.py`、`schemas.py` | 新APIとフレーム形式、既存配信経路との実行枠共有 |
+| `server/app/routers/VideosRouter.py`、`client/src/services/Videos.ts` | オフライン保存一覧で確認した録画ファイルに限定する削除要求 |
 | `server/app/streams/VideoStream.py`、`VideoEncodingTask.py` | 新経路だけの生成抑制・同一実行保証・正常終端 |
 | `server/app/app.py` | shutdown時のセッション回収 |
 | `client/src/services/OfflineVideos.ts`、`OfflineVideoStorage.ts` | 同一ジョブの自動再接続、手動再試行、既存世代の保護 |
