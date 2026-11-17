@@ -1,6 +1,6 @@
 import OfflineVideoStorage from '@/services/OfflineVideoStorage';
 import Videos, { type IRecordedProgram } from '@/services/Videos';
-import Utils from '@/utils';
+import Utils, { dayjs } from '@/utils';
 
 
 /** オフライン保存ジョブの状態 */
@@ -783,7 +783,7 @@ export default class OfflineVideos {
             let milliseconds = 0;
             if (retryAfter !== null) {
                 const seconds = Number(retryAfter);
-                milliseconds = Number.isFinite(seconds) ? seconds * 1000 : Date.parse(retryAfter) - Date.now();
+                milliseconds = Number.isFinite(seconds) ? seconds * 1000 : dayjs(retryAfter).diff(dayjs());
             }
             throw new OfflineDownloadNetworkError(
                 `オフライン保存の通信に失敗しました。(HTTP ${response.status})`,
