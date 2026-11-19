@@ -428,6 +428,62 @@ async def test_recorded_file_copied__original_deleted_by_api(
     await WaitUntil(lambda: IsRecordedProgramGone(client, copied_path))
 
 
+async def test_offline_recording_delete_checks_confirmed_file(
+    client: httpx.AsyncClient,
+    recorded_folder: Path,
+    admin_headers: dict[str, str],
+) -> None:
+    """
+    オフライン保存一覧で確認したファイルのパスとハッシュが一致する場合だけ削除する。
+
+    Args:
+        client (httpx.AsyncClient): テスト用 API クライアント
+        recorded_folder (Path): テスト用サーバーが監視する録画フォルダ
+        admin_headers (dict[str, str]): 管理者として API を呼び出すためのヘッダー
+    Returns:
+        None
+    """
+
+    await WaitForStartupScan(client)
+    recorded_at = datetime(2019, 8, 19, 20, 45, tzinfo=JST)
+    path = PlaceRecording('terrestrial-tsreplace-h264.ts', recorded_folder / 'confirmed-delete', recorded_at)
+    program = await WaitUntil(lambda: GetRecordedProgramByPath(client, path))
+    video_id = program['id']
+    url = f'/api/videos/{video_id}'
+    file_hash = program['recorded_video']['file_hash']
+    confirmed_file = {'file_path': str(path), 'file_hash': file_hash}
+
+    # 移動や録画 ID の再利用前に確認した情報で削除を要求しても、現在の録画は残る。
+    for expected_path, expected_hash in [(str(path.with_name('other.ts')), file_hash), (str(path), 'different-hash')]:
+        response = await client.request(
+            'DELETE',
+            url,
+            headers = admin_headers,
+            json = {'file_path': expected_path, 'file_hash': expected_hash},
+        )
+        assert response.status_code == 409, response.text
+        assert response.json()['detail'] == 'The confirmed recording file is no longer available.'
+        assert await anyio.Path(path).is_file()
+        assert (await client.get(url)).status_code == 200
+
+    # 再解析に失敗した直後は、DB のパスとハッシュが確認時と同じでも現在の録画を削除できない。
+    await RecordedVideo.filter(recorded_program_id=video_id).update(status='AnalysisFailed')
+    response = await client.request('DELETE', url, headers=admin_headers, json=confirmed_file)
+    assert response.status_code == 409, response.text
+    assert await anyio.Path(path).is_file()
+    await RecordedVideo.filter(recorded_program_id=video_id).update(status='Recorded')
+
+    response = await client.request(
+        'DELETE',
+        url,
+        headers = admin_headers,
+        json = confirmed_file,
+    )
+    assert response.status_code == 204, response.text
+    assert await anyio.Path(path).exists() is False
+    assert (await client.get(url)).status_code == 422
+
+
 # -------------------------------------------------------------------------------------
 # 録画ファイルを別のファイルシステムや別のドライブへ移しても、同じ録画番組のまま付け替わるフロー
 # (録画フォルダの監視 → GET /api/videos) - 正常系

@@ -249,6 +249,11 @@ class RecordedPrograms(BaseModel):
     total: int
     recorded_programs: list[RecordedProgram]
 
+class VideoDeleteRequest(BaseModel):
+    # 削除確認に表示した録画ファイルの情報
+    file_path: str
+    file_hash: str
+
 class OfflineVideoStreamMetadata(BaseModel):
     # 保存対象の録画番組 ID
     video_id: int
