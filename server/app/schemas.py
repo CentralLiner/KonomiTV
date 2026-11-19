@@ -259,6 +259,40 @@ class OfflineVideoStreamMetadata(BaseModel):
     # 保存容量の見積もりとプレイリスト生成に使う録画時間
     duration_seconds: float
 
+class OfflineVideoSessionInfo(OfflineVideoStreamMetadata):
+    # RAM 保存セッションで使う配信形式のバージョン
+    protocol_version: Literal[2] = 2
+    # 同じ保存 ID で作り直されたセッションと区別するトークン
+    generation_token: str
+
+class OfflineVideoSessionStreamMetadata(OfflineVideoSessionInfo):
+    session_id: str
+    # この接続で送信する最初のセグメント番号
+    next_sequence: int
+
+class OfflineVideoCheckpoint(BaseModel):
+    # 端末への保存が確定した連続範囲の次の番号
+    next_sequence: Annotated[
+        int,
+        Field(
+            ge = 0,
+            le = 0xfffffffe,
+            strict = True,
+        ),
+    ]
+    # 現在の HTTP 接続の番号。JavaScript で正確に扱える整数の範囲に収める
+    connection_id: Annotated[
+        int,
+        Field(
+            ge = 1,
+            le = 2**53 - 1,
+            strict = True,
+        ),
+    ]
+
+class OfflineVideoSessionErrorDetail(TypedDict):
+    code: str
+
 # ***** シリーズ *****
 
 class Series(PydanticModel):

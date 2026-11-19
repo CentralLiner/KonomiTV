@@ -637,7 +637,7 @@ class MetadataAnalyzer:
         return recorded_program
 
 
-    def matchesFileHash(self, file_hash: str) -> bool:
+    def matchesFileHash(self, file_hash: str, *, raise_on_error: bool = False) -> bool:
         """
         録画ファイルの中身が、指定されたハッシュで登録済みの録画と同じかを、メタデータを解析せずに判定する
         録画ファイルの移動や名前の変更を、重い解析の前に照合するために使う
@@ -645,6 +645,7 @@ class MetadataAnalyzer:
 
         Args:
             file_hash (str): 登録済みの録画ファイルのハッシュ
+            raise_on_error (bool): ゼロ埋め境界の探索中に発生した例外を呼び出し元に伝えるか
 
         Returns:
             bool: 録画ファイルのハッシュが一致する場合は True
@@ -663,7 +664,7 @@ class MetadataAnalyzer:
             f.seek(packet_size - ts.PACKET_SIZE)
             if f.read(1) != ts.SYNC_BYTE:
                 return False
-        duration_result = self.__calculateTSFileDuration()
+        duration_result = self.__calculateTSFileDuration(raise_on_error = raise_on_error)
         if duration_result is None:
             return False
         _, end_ts_offset = duration_result
@@ -748,7 +749,12 @@ class MetadataAnalyzer:
         return hash_obj.hexdigest()
 
 
-    def __calculateTSFileDuration(self, search_block_size: int = 1024 * 1024) -> tuple[float, int] | None:
+    def __calculateTSFileDuration(
+        self,
+        search_block_size: int = 1024 * 1024,
+        *,
+        raise_on_error: bool = False,
+    ) -> tuple[float, int] | None:
         """
         TS ファイル内の最初と最後の有効な PCR タイムスタンプから再生時間（秒）を算出する (written with o3-mini)
         FFprobe から再生時間を取得できなかった場合のフォールバックとして利用する
@@ -757,6 +763,7 @@ class MetadataAnalyzer:
 
         Args:
             search_block_size (int): PCR 抽出時に読み込むブロックサイズ (バイト単位). デフォルト: 1MB
+            raise_on_error (bool): 探索中に発生した例外を呼び出し元に伝えるか
 
         Returns:
             tuple[float, int] | None: (再生時間（秒）, 有効な TS データの終了位置) のタプル
@@ -881,6 +888,9 @@ class MetadataAnalyzer:
                 return (duration, valid_data_end)
 
         except Exception as ex:
+            # 保存セッションは、一時的な I/O 障害と実装上の例外を区別して扱う。
+            if raise_on_error:
+                raise
             logging.error('Error in fallback duration calculation:', exc_info=ex)
             return None
 

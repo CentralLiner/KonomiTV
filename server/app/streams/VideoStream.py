@@ -12,7 +12,7 @@ import weakref
 from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
-from typing import ClassVar, Literal
+from typing import TYPE_CHECKING, ClassVar, Literal
 
 from biim.mpeg2ts import ts
 from fastapi import HTTPException, status
@@ -31,6 +31,10 @@ from app.utils import SetTimeout
 from app.utils.MP4KeyFrameParser import MP4KeyFrameParser
 from app.utils.TSKeyFrameSeeker import TSKeyFrameSeeker, TSStreamInfo
 from app.utils.TSSecondaryAudioExtractor import TSSecondaryAudioExtractor
+
+
+if TYPE_CHECKING:
+    from app.streams.OfflineVideoSession import OfflineVideoSession
 
 
 @dataclass
@@ -116,13 +120,14 @@ class VideoStream:
         recorded_program: RecordedProgram,
         quality: QUALITY_TYPES,
         encoding_options: StreamEncodingOptions,
+        offline_session: OfflineVideoSession | None = None,
     ) -> VideoStream:
 
         # まだ同じセッション ID のインスタンスがないときだけ、インスタンスを生成する
         ## どの API も URL の品質文字列から録画番組・画質・追加オプションを受け取るため、プレイリスト以外の API からも作成できる
         ## 通信断で SESSION_TIMEOUT を超えてセッションが破棄された後も、プレイヤーはプレイリストを取得し直さずに
         ## 同じ session_id でセグメントや Keep-Alive を要求し続けるため、その要求からセッションを作り直して再生を継続させる
-        if session_id not in cls.__instances:
+        if offline_session is not None or session_id not in cls.__instances:
 
             # 新しい録画視聴セッションのインスタンスを生成する
             instance = super().__new__(cls)
@@ -134,6 +139,8 @@ class VideoStream:
             instance.recorded_program = recorded_program
             instance.quality = quality
             instance.encoding_options = encoding_options
+            # RAM 保存時だけ、エンコード結果と生存期限を管理するセッションを保持する
+            instance.offline_session = offline_session
 
             # HLS セグメントの基準長 (秒)
             ## 録画ファイルのフレームレートから算出し、プレイリスト生成とオンデマンド探索で共通利用する
@@ -177,10 +184,11 @@ class VideoStream:
 
             # キャンセルされない限り SESSION_TIMEOUT 秒後にインスタンスを破棄するタイマー
             # cancel_destroy_timer() を呼び出すことでタイマーをキャンセルできる
-            instance._cancel_destroy_timer = SetTimeout(lambda: asyncio.create_task(instance.destroy()), cls.SESSION_TIMEOUT)
-
-            # 生成したインスタンスを登録する
-            cls.__instances[session_id] = instance
+            # RAM 保存用のインスタンスは OfflineVideoSession が所有する
+            instance._cancel_destroy_timer = None
+            if offline_session is None:
+                instance._cancel_destroy_timer = SetTimeout(lambda: asyncio.create_task(instance.destroy()), cls.SESSION_TIMEOUT)
+                cls.__instances[session_id] = instance
 
             logging.info(f'{instance.log_prefix} Streaming Session Started.')
 
@@ -214,8 +222,7 @@ class VideoStream:
                     detail = 'Session exists but encoding options mismatch',
                 )
 
-        # 登録されているインスタンスを返す
-        return cls.__instances[session_id]
+        return instance
 
 
     def __init__(
@@ -224,6 +231,7 @@ class VideoStream:
         recorded_program: RecordedProgram,
         quality: QUALITY_TYPES,
         encoding_options: StreamEncodingOptions,
+        offline_session: OfflineVideoSession | None = None,
     ) -> None:
         """
         録画視聴セッションのインスタンスを取得する
@@ -233,6 +241,10 @@ class VideoStream:
             recorded_program (RecordedProgram): 録画番組の情報
             quality (QUALITY_TYPES): 映像の品質 (1080p-60fps ~ 240p)
             encoding_options (StreamEncodingOptions): ベース画質に追加するエンコードオプション
+            offline_session (OfflineVideoSession | None): RAM 保存用ストリームを所有するセッション
+
+        Returns:
+            None
         """
 
         # インスタンス変数の型ヒントを定義
@@ -241,6 +253,7 @@ class VideoStream:
         self.recorded_program: RecordedProgram
         self.quality: QUALITY_TYPES
         self.encoding_options: StreamEncodingOptions
+        self.offline_session: OfflineVideoSession | None
         self._segment_duration_seconds: float
         self._segments: list[VideoStreamSegment]
         self._segment_map_by_sequence: dict[int, SegmentMapEntry]
@@ -252,7 +265,7 @@ class VideoStream:
         self._video_encoding_task_lock: asyncio.Lock
         self._video_encoding_task_ref: asyncio.Task[None] | None
         self._detached_video_encoding_task_refs: set[asyncio.Task[None]]
-        self._cancel_destroy_timer: Callable[[], None]
+        self._cancel_destroy_timer: Callable[[], None] | None
 
 
     @property
@@ -271,6 +284,20 @@ class VideoStream:
         基本一度 VideoStream 内部でセットされたら外部から変更されるべきではないので、読み取り専用にしている
         """
         return tuple(self._segments)
+
+
+    @property
+    def segment_duration_seconds(self) -> float:
+        """
+        フレームレートから算出した通常セグメント長を返す。
+
+        Args:
+            なし
+
+        Returns:
+            float: セグメントの基準長 (秒)
+        """
+        return self._segment_duration_seconds
 
 
     @property
@@ -308,11 +335,12 @@ class VideoStream:
 
         async with self._source_position_lock:
             file_path = Path(recorded_video.file_path)
+            run_file_io = self.offline_session.runFileIO if self.offline_session is not None else asyncio.to_thread
 
             # segment_map キャッシュから再生を開始した場合、ソース位置は即時解決できても PID 情報が未取得のままになる
             ## 再生中のキーフレーム収集は入力 TS の PES を読むため、必要になった時点で一度だけ PAT/PMT を読む
             if self._ts_stream_info is None:
-                self._ts_stream_info = await asyncio.to_thread(
+                self._ts_stream_info = await run_file_io(
                     TSKeyFrameSeeker.findStreamInfo,
                     file_path,
                 )
@@ -320,7 +348,7 @@ class VideoStream:
             # segment_map をプレイリスト時刻へ対応させるには、録画先頭の DTS が基準として必要になる
             ## ここも同一セッション内で変わらないため、未取得のときだけ読み込む
             if self._ts_source_base_dts is None:
-                self._ts_source_base_dts = await asyncio.to_thread(
+                self._ts_source_base_dts = await run_file_io(
                     TSKeyFrameSeeker.findBaseDTS,
                     file_path,
                     self._ts_stream_info,
@@ -367,7 +395,8 @@ class VideoStream:
         """
 
         # 終了処理へ入ったセッションは、待機中だった要求から生存期限を更新して復活させない
-        if self._is_destroyed is True:
+        # RAM 保存の生存期限は OfflineVideoSession が管理する
+        if self._is_destroyed is True or self._cancel_destroy_timer is None:
             return
 
         # 前回のタイマーをキャンセルする
@@ -375,6 +404,22 @@ class VideoStream:
 
         # キャンセルされない限り SESSION_TIMEOUT 秒後にインスタンスを破棄するタイマーを設定する
         self._cancel_destroy_timer = SetTimeout(lambda: asyncio.create_task(self.destroy()), self.SESSION_TIMEOUT)
+
+
+    async def encodeOffline(self) -> None:
+        """
+        RAM 保存用のエンコードを先頭から実行し、プロセスの終了まで待つ。
+
+        Args:
+            なし
+
+        Returns:
+            None
+        """
+        assert self.offline_session is not None
+        self._ensureSegmentsInitialized()
+        await self.resolveSegmentSourcePosition(0)
+        await self._video_encoding_task.run(0)
 
 
     def getBufferRange(self) -> tuple[float, float]:
@@ -507,6 +552,7 @@ class VideoStream:
 
             recorded_video = self.recorded_program.recorded_video
             file_path = Path(recorded_video.file_path)
+            run_file_io = self.offline_session.runFileIO if self.offline_session is not None else asyncio.to_thread
 
             if recorded_video.container_format == 'MPEG-TS':
                 # segment_map は再生開始位置のキャッシュなので、見つかればファイル I/O なしで即座に使う
@@ -523,18 +569,18 @@ class VideoStream:
 
                 # PAT/PMT と先頭 DTS は同一視聴セッション内で変わらないため、最初の探索時だけ読む
                 if self._ts_stream_info is None:
-                    self._ts_stream_info = await asyncio.to_thread(
+                    self._ts_stream_info = await run_file_io(
                         TSKeyFrameSeeker.findStreamInfo,
                         file_path,
                     )
                 if self._ts_source_base_dts is None:
-                    self._ts_source_base_dts = await asyncio.to_thread(
+                    self._ts_source_base_dts = await run_file_io(
                         TSKeyFrameSeeker.findBaseDTS,
                         file_path,
                         self._ts_stream_info,
                     )
 
-                source_position = await asyncio.to_thread(
+                source_position = await run_file_io(
                     TSKeyFrameSeeker.seek,
                     file_path,
                     self._ts_stream_info,
@@ -563,7 +609,7 @@ class VideoStream:
 
             # MP4 は moov 内テーブルから同期サンプル DTS を短時間で復元できるため、DB キャッシュを作らない
             if self._mp4_keyframe_dts_list is None:
-                self._mp4_keyframe_dts_list = await asyncio.to_thread(
+                self._mp4_keyframe_dts_list = await run_file_io(
                     MP4KeyFrameParser.readVideoKeyFrameDTS,
                     file_path,
                 )
@@ -659,6 +705,10 @@ class VideoStream:
         if len(segment_map_entries) == 0:
             return
 
+        # RAM 保存では、今回探索した位置がセッション作成時の録画に対応する場合だけ保存する。
+        if self.offline_session is not None and await self.offline_session.matchesRecording() is not True:
+            return
+
         try:
             # セッション生成時に受け取った ORM インスタンスへ、保存後の最新 JSON を反映する
             ## 実際のマージは DB から読み直した RecordedVideo に対して行う
@@ -686,6 +736,9 @@ class VideoStream:
                     latest_recorded_video = await RecordedVideo.select_for_update().get_or_none(id=recorded_video.id)
                     if latest_recorded_video is None:
                         logging.warning(f'{self.log_prefix} RecordedVideo was not found while saving segment map entries.')
+                        return
+                    # 録画スキャンが照合後に同じレコードを更新した場合は、スキャン後の値を保持する。
+                    if self.offline_session is not None and not self.offline_session.matchesRecordedVideo(latest_recorded_video):
                         return
 
                     # DB から読み直した最新の segment_map をベースに、今回の候補をマージしていく
@@ -965,11 +1018,12 @@ class VideoStream:
         if self._is_destroyed is True:
             return
         self._is_destroyed = True
-        self._cancel_destroy_timer()
+        if self._cancel_destroy_timer is not None:
+            self._cancel_destroy_timer()
 
         # 明示的な終了処理と生存期限タイマーが競合しても、新しく作られた同名セッションや登録解除済みセッションへ触れない
         async with self._video_encoding_task_lock:
-            if self.__instances.get(self.session_id) is not self:
+            if self.offline_session is None and self.__instances.get(self.session_id) is not self:
                 return
 
             # 起動中のエンコードタスクがあればキャンセルする
@@ -985,6 +1039,7 @@ class VideoStream:
             # すべての HLS セグメントと、アクティブな間保持されていたインスタンスを削除する
             ## 今後同じセッション ID が指定された場合は新たに別のインスタンスが生成される
             self._segments = []
-            self.__instances.pop(self.session_id)
+            if self.offline_session is None:
+                self.__instances.pop(self.session_id)
 
         logging.info(f'{self.log_prefix} Streaming Session Finished.')

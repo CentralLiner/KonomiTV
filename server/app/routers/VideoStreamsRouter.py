@@ -5,7 +5,7 @@ import struct
 import uuid
 from typing import Annotated, Literal
 
-from fastapi import APIRouter, Depends, HTTPException, Path, Query, status
+from fastapi import APIRouter, Depends, Header, HTTPException, Path, Query, status
 from fastapi.responses import Response, StreamingResponse
 from sse_starlette.sse import EventSourceResponse
 from starlette.background import BackgroundTask
@@ -13,7 +13,17 @@ from starlette.background import BackgroundTask
 from app import logging
 from app.constants import QUALITY
 from app.models.RecordedProgram import RecordedProgram
-from app.schemas import OfflineVideoStreamMetadata
+from app.schemas import (
+    OfflineVideoCheckpoint,
+    OfflineVideoSessionInfo,
+    OfflineVideoStreamMetadata,
+)
+from app.streams.OfflineVideoSession import (
+    OFFLINE_VIDEO_STREAM_SEMAPHORE,
+    OfflineVideoSession,
+    OfflineVideoSessionError,
+    OfflineVideoSessionResponse,
+)
 from app.streams.StreamEncodingOptions import (
     SplitQualityAndEncodingOptions,
     StreamQualityWithOptions,
@@ -26,10 +36,6 @@ router = APIRouter(
     tags = ['Streams'],
     prefix = '/api/streams/video',
 )
-
-# オフライン保存はエンコーダーを長時間占有するため、通常視聴分の余裕を残して同時実行数を制限する
-OFFLINE_VIDEO_STREAM_SEMAPHORE = asyncio.Semaphore(3)
-
 
 async def ValidateVideoID(video_id: Annotated[int, Path(description='録画番組の ID 。')]) -> RecordedProgram:
     """ 録画番組 ID のバリデーション """
@@ -432,3 +438,134 @@ async def VideoOfflineStreamAPI(
         # クライアントが応答開始直後に切断し、ジェネレーター本体が一度も実行されない場合も必ず解放する
         background = BackgroundTask(CleanupOfflineVideoStream),
     )
+
+
+@router.get(
+    '/{video_id}/{quality}/offline-sessions/{session_id}',
+    summary = '録画番組のオフライン保存セッション接続 API',
+    response_class = StreamingResponse,
+)
+async def VideoOfflineSessionStreamAPI(
+    session_id: Annotated[str, Path(pattern=r'^[0-9a-f]{32}$')],
+    video_id: int,
+    quality: str,
+    next_sequence: Annotated[int, Query(ge=0, le=0xfffffffe)],
+    connection_id: Annotated[int, Query(ge=1, le=2**53 - 1)],
+    generation_token: Annotated[str | None, Header(alias='X-KonomiTV-Offline-Generation')] = None,
+) -> StreamingResponse:
+    """
+    同じエンコード結果を、端末で未保存のセグメントから返す。
+
+    Args:
+        session_id (str): 接続先の保存 ID
+        video_id (int): 保存する録画番組の ID
+        quality (str): 追加オプションを含む要求画質
+        next_sequence (int): 端末でまだ保存していない最初のセグメント番号
+        connection_id (int): 接続を開くたびに増加する番号
+        generation_token (str | None): セッションの作成時に受け取った世代トークン
+
+    Returns:
+        StreamingResponse: 指定位置からのセグメントを送るレスポンス
+    """
+
+    session = OfflineVideoSession.get(session_id, video_id, quality, generation_token)
+    if session is None:
+        raise OfflineVideoSessionError(410, 'session_unavailable')
+    await session.connect(connection_id, next_sequence)
+    return OfflineVideoSessionResponse(session, connection_id, next_sequence)
+
+
+@router.put(
+    '/{video_id}/{quality}/offline-sessions/{session_id}',
+    summary = '録画番組のオフライン保存セッション作成 API',
+    status_code = status.HTTP_201_CREATED,
+    responses = {status.HTTP_200_OK: {'model': OfflineVideoSessionInfo}},
+)
+async def VideoOfflineSessionCreateAPI(
+    session_id: Annotated[str, Path(pattern=r'^[0-9a-f]{32}$')],
+    recorded_program: Annotated[RecordedProgram, Depends(ValidateVideoID)],
+    stream_quality: Annotated[StreamQualityWithOptions, Depends(ValidateQuality)],
+    quality: str,
+    response: Response,
+) -> OfflineVideoSessionInfo:
+    """
+    オフライン保存用の RAM セッションを登録する。
+
+    Args:
+        session_id (str): クライアントが発行した保存 ID
+        recorded_program (RecordedProgram): 保存する録画番組
+        stream_quality (StreamQualityWithOptions): 検証済みの画質とエンコードオプション
+        quality (str): 追加オプションを含む要求画質
+        response (Response): 新規作成と再要求でステータスを切り替えるレスポンス
+
+    Returns:
+        OfflineVideoSessionInfo: 録画情報、画質、世代トークンを含むセッション情報
+    """
+
+    session, is_created = OfflineVideoSession.create(session_id, recorded_program, quality, stream_quality)
+    response.headers['Cache-Control'] = 'no-store'
+    if not is_created:
+        response.status_code = status.HTTP_200_OK
+    return session.info
+
+
+@router.delete(
+    '/{video_id}/{quality}/offline-sessions/{session_id}',
+    summary = '録画番組のオフライン保存セッション終了 API',
+    status_code = status.HTTP_204_NO_CONTENT,
+)
+async def VideoOfflineSessionDeleteAPI(
+    session_id: Annotated[str, Path(pattern=r'^[0-9a-f]{32}$')],
+    video_id: int,
+    quality: str,
+    generation_token: Annotated[str | None, Header(alias='X-KonomiTV-Offline-Generation')] = None,
+) -> Response:
+    """
+    オフライン保存セッションが所有する資源を回収する。
+
+    Args:
+        session_id (str): 終了する保存 ID
+        video_id (int): 保存する録画番組の ID
+        quality (str): 追加オプションを含む要求画質
+        generation_token (str | None): セッションの作成時に受け取った世代トークン
+
+    Returns:
+        Response: 回収が完了したことを示す 204 レスポンス
+    """
+
+    session = OfflineVideoSession.get(session_id, video_id, quality, generation_token)
+    if session is not None:
+        await asyncio.shield(session.close())
+    return Response(status_code=status.HTTP_204_NO_CONTENT)
+
+
+@router.put(
+    '/{video_id}/{quality}/offline-sessions/{session_id}/checkpoint',
+    summary = '録画番組のオフライン保存進捗確認 API',
+)
+async def VideoOfflineSessionCheckpointAPI(
+    session_id: Annotated[str, Path(pattern=r'^[0-9a-f]{32}$')],
+    video_id: int,
+    quality: str,
+    checkpoint: OfflineVideoCheckpoint,
+    generation_token: Annotated[str | None, Header(alias='X-KonomiTV-Offline-Generation')] = None,
+) -> OfflineVideoCheckpoint:
+    """
+    端末が連続して保存できた位置を受け取り、現在の確定位置を返す。
+
+    Args:
+        session_id (str): 通知先の保存 ID
+        video_id (int): 保存する録画番組の ID
+        quality (str): 追加オプションを含む要求画質
+        checkpoint (OfflineVideoCheckpoint): 接続番号と次に保存するセグメント番号
+        generation_token (str | None): セッションの作成時に受け取った世代トークン
+
+    Returns:
+        OfflineVideoCheckpoint: 接続番号とサーバーが確認済みの位置
+    """
+
+    session = OfflineVideoSession.get(session_id, video_id, quality, generation_token)
+    if session is None:
+        raise OfflineVideoSessionError(410, 'session_unavailable')
+    next_sequence = session.checkpoint(checkpoint.connection_id, checkpoint.next_sequence)
+    return OfflineVideoCheckpoint(connection_id=checkpoint.connection_id, next_sequence=next_sequence)
