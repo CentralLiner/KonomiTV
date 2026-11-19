@@ -206,14 +206,49 @@ export default class OfflineVideos {
         }
     }
 
+    /** 失敗したジョブを同じ画質と保存方式で先頭からやり直す。 */
+    static async retry(jobID: string): Promise<IOfflineDownloadJob | null> {
+        const failedJob = await OfflineVideoStorage.getJob(jobID);
+        if (failedJob?.state !== 'Failed') {
+            throw new Error('やり直す保存が見つかりませんでした。');
+        }
+        const program = await Videos.fetchVideo(failedJob.video_id);
+        if (program === null) {
+            // 番組の取得エラーの表示は、ほかの録画画面と同じく Videos に任せる。
+            return null;
+        }
+
+        // DB 再構築で同じ ID に別の録画が割り当てられることがある。差し替え前後の録画は放送回で照合する。
+        if (!this.isSameRecording(program, failedJob.program)) {
+            throw new Error('同じ録画番組か確認できませんでした。録画番組の画面から保存を開始してください。');
+        }
+        return await this.start(program, failedJob.quality, failedJob.background_fetch_id !== null, jobID);
+    }
+
+    /** ファイルハッシュまたは放送回の情報で、同じ録画番組かを照合する。 */
+    static isSameRecording(program: IRecordedProgram, previousProgram: IRecordedProgram): boolean {
+        const previousFileHash = previousProgram.recorded_video.file_hash;
+        if (previousFileHash && program.recorded_video.file_hash === previousFileHash) return true;
+        return typeof previousProgram.network_id === 'number' && program.network_id === previousProgram.network_id &&
+            typeof previousProgram.service_id === 'number' && program.service_id === previousProgram.service_id &&
+            typeof previousProgram.event_id === 'number' && program.event_id === previousProgram.event_id &&
+            typeof previousProgram.start_time === 'string' && program.start_time === previousProgram.start_time;
+    }
+
     /**
      * 録画番組のオフライン保存を開始する。
      * @param program 保存する録画番組
      * @param quality 追加オプションを含む API 画質
      * @param useBackgroundFetch ダイアログでバックグラウンド保存が選ばれたか (未対応環境では前景 Fetch を使う)
+     * @param retryJobID 一覧から再試行する場合に引き継ぐ失敗ジョブの ID
      * @returns 作成した保存ジョブ
      */
-    static async start(program: IRecordedProgram, quality: string, useBackgroundFetch: boolean = false): Promise<IOfflineDownloadJob> {
+    static async start(
+        program: IRecordedProgram,
+        quality: string,
+        useBackgroundFetch: boolean = false,
+        retryJobID?: string,
+    ): Promise<IOfflineDownloadJob> {
 
         // Vue コンポーネントから渡される番組情報はリアクティブ Proxy のため、そのままでは IndexedDB の構造化複製に失敗する
         // API 由来の JSON データだけを保存時点のスナップショットへ変換し、Service Worker からも安全に読み出せる値へ固定する
@@ -239,6 +274,9 @@ export default class OfflineVideos {
             // ダイアログのスイッチがオンで、かつ Background Fetch API が使えるときだけバックグラウンド保存する
             // オフや未対応環境ではページ内 Fetch で保存し、複数本の同時ダウンロードを優先する
             const shouldUseBackgroundFetch = useBackgroundFetch === true && await this.isBackgroundFetchSupported() === true;
+            if (retryJobID !== undefined && useBackgroundFetch && !shouldUseBackgroundFetch) {
+                throw new Error('このブラウザではバックグラウンド保存を利用できません。');
+            }
 
             // Background Fetch は一時レスポンスと展開後キャッシュが併存するため、前景保存の2倍を空き容量判定へ使う
             const storageEstimate = await navigator.storage?.estimate() ?? {};
@@ -265,7 +303,7 @@ export default class OfflineVideos {
             };
             const releaseForegroundLock = shouldUseBackgroundFetch === false ? await this.acquireForegroundLock(job.job_id) : null;
             try {
-                await OfflineVideoStorage.putJobIfVideoIdle(job);
+                await OfflineVideoStorage.putJobIfVideoIdle(job, retryJobID);
             } catch (error) {
                 releaseForegroundLock?.();
                 throw error;
@@ -906,17 +944,6 @@ export default class OfflineVideos {
             this.foregroundAbortControllers.get(job.job_id)?.abort();
         }
         await OfflineVideoStorage.deleteGeneration(job.video_id, job.generation_id);
-    }
-
-    /**
-     * 保存済み動画を端末から削除する。
-     * @param videoID 録画番組 ID
-     */
-    static async deleteVideo(videoID: number): Promise<void> {
-
-        const video = await this.getVideo(videoID);
-        if (video === null) return;
-        await OfflineVideoStorage.deleteVideo(video);
     }
 
     /**

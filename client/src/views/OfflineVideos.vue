@@ -14,9 +14,10 @@
                         :total="displayTotal" :hideSort="true" :hidePagination="true" :showBackButton="true"
                         :showEmptyMessage="isLoading === false" :isLoading="isLoading" :forOffline="true"
                         :offlineVideos="videos" :offlineJobs="visibleOfflineJobs"
+                        :retryingOfflineJobIDs="retryingJobIDs"
                         emptyIcon="fluent:cloud-off-24-regular" emptyMessage="オフライン保存した番組はありません。"
                         emptySubMessage="録画番組のメニューまたは視聴画面から保存できます。"
-                        @cancelOfflineJob="cancelJob" @dismissOfflineJob="dismissJob">
+                        @cancelOfflineJob="cancelJob" @retryOfflineJob="retryJob" @dismissOfflineJob="dismissJob">
                         <template #after-header>
                             <section class="offline-videos-storage">
                                 <div class="offline-videos-storage__item">
@@ -71,28 +72,26 @@ const jobs = ref<IOfflineDownloadJob[]>([]);
 const storageUsageBytes = ref(0);
 const storageQuotaBytes = ref(0);
 const isLoading = ref(true);
+const retryingJobIDs = ref(new Set<string>());
 let isRefreshing = false;
 
 const activeJobs = computed(() => jobs.value.filter(job => ['Waiting', 'Downloading', 'Finalizing'].includes(job.state)));
-const visibleOfflineJobs = computed(() => jobs.value.filter(job =>
-    ['Waiting', 'Downloading', 'Finalizing', 'Failed'].includes(job.state),
-));
+const visibleOfflineJobs = computed(() => {
+    // 保存済み動画の欠損で同じ録画 ID に失敗ジョブが増えても、進行中の保存を操作できるようにする。
+    const activeVideoIDs = new Set(activeJobs.value.map(job => job.video_id));
+    return jobs.value.filter(job => ['Waiting', 'Downloading', 'Finalizing'].includes(job.state) ||
+        (job.state === 'Failed' && !activeVideoIDs.has(job.video_id)));
+});
 const savedSizeBytes = computed(() => videos.value.reduce((total, video) => total + video.size_bytes, 0));
 
 /** 保存済み動画と保存ジョブを1つの一覧へ統合する */
 const displayPrograms = computed((): IRecordedProgram[] => {
-    const programs: IRecordedProgram[] = [];
-    const seenVideoIDs = new Set<number>();
-
-    // 実行中・失敗のジョブを先頭へ並べ、同じ番組の二重表示を防ぐ
-    for (const job of visibleOfflineJobs.value) {
-        if (seenVideoIDs.has(job.video_id) === true) continue;
-        seenVideoIDs.add(job.video_id);
-        programs.push(job.program);
-    }
+    const visibleJobs = visibleOfflineJobs.value;
+    // 保存世代の欠損と保存処理の失敗は、各ジョブから個別に再試行・削除できるようにする。
+    const programs = visibleJobs.map(job => job.program);
     for (const video of videos.value) {
-        if (seenVideoIDs.has(video.video_id) === true) continue;
-        seenVideoIDs.add(video.video_id);
+        // 録画 ID が別の番組に再利用された場合は、保存済み動画を独立した行から再生できるようにする。
+        if (visibleJobs.some(job => job.video_id === video.video_id && OfflineVideos.isSameRecording(video.program, job.program))) continue;
         programs.push(video.program);
     }
     return programs;
@@ -216,7 +215,20 @@ const dismissJob = async (jobID: string): Promise<void> => {
     }
 };
 
-// 保存処理のイベントに加え、Background Fetch の進捗も画面表示中だけ定期的に読み直す
+const retryJob = async (jobID: string): Promise<void> => {
+    if (retryingJobIDs.value.has(jobID)) return;
+    retryingJobIDs.value.add(jobID);
+    try {
+        await OfflineVideos.retry(jobID);
+    } catch (error) {
+        Message.error(error instanceof Error ? error.message : 'オフライン保存をやり直せませんでした。');
+    } finally {
+        retryingJobIDs.value.delete(jobID);
+        await refresh();
+    }
+};
+
+// 保存処理のイベントに加え、実行中のジョブの進捗を画面表示中だけ定期的に読み直す
 let refreshTimerID: number | null = null;
 watch(() => activeJobs.value.length > 0, (hasActiveJobs) => {
     // Background Fetch 進捗だけを1秒おきに反映し、IndexedDB 全読み直しによる UI の巻き戻りを避ける

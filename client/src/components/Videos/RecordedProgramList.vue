@@ -67,12 +67,14 @@
                 </div>
             </div>
             <div class="recorded-program-list__grid-content">
-                <RecordedProgram v-for="program in displayPrograms" :key="program.id" :program="program"
+                <RecordedProgram v-for="{program, job, video} in displayProgramEntries"
+                    :key="job?.job_id ?? video?.generation_id ?? program.id" :program="program"
                     :forMylist="forMylist" :forWatchedHistory="forWatchedHistory" :forOffline="forOffline"
-                    :offlineVideo="offlineVideos?.find(video => video.video_id === program.id) ?? null"
-                    :offlineDownloadJob="getOfflineDownloadJob(program.id)"
+                    :offlineVideo="video" :offlineDownloadJob="job"
+                    :isRetryingOfflineJob="job !== null && retryingOfflineJobIDs?.has(job.job_id)"
                     @deleted="handleProgramDeleted"
                     @cancelOfflineJob="jobID => $emit('cancelOfflineJob', jobID)"
+                    @retryOfflineJob="jobID => $emit('retryOfflineJob', jobID)"
                     @dismissOfflineJob="jobID => $emit('dismissOfflineJob', jobID)" />
             </div>
         </div>
@@ -90,12 +92,11 @@
 </template>
 <script lang="ts" setup>
 
-import { ref, watch } from 'vue';
+import { computed, ref, watch } from 'vue';
 import { useRouter } from 'vue-router';
 
-import type { IOfflineDownloadJob, IOfflineVideo } from '@/services/OfflineVideos';
-
 import RecordedProgram from '@/components/Videos/RecordedProgram.vue';
+import OfflineVideos, { type IOfflineDownloadJob, type IOfflineVideo } from '@/services/OfflineVideos';
 import { type IRecordedProgram, MylistSortOrder, SortOrder } from '@/services/Videos';
 import Utils from '@/utils';
 
@@ -124,6 +125,7 @@ const props = withDefaults(defineProps<{
     forOffline?: boolean;
     offlineVideos?: IOfflineVideo[];
     offlineJobs?: IOfflineDownloadJob[];
+    retryingOfflineJobIDs?: ReadonlySet<string>;
 }>(), {
     page: 1,
     sortOrder: 'desc',
@@ -151,6 +153,7 @@ defineEmits<{
     (e: 'update:sortOrder', order: SortOrder | MylistSortOrder): void;
     (e: 'more'): void;
     (e: 'cancelOfflineJob', jobID: string): void;
+    (e: 'retryOfflineJob', jobID: string): void;
     (e: 'dismissOfflineJob', jobID: string): void;
 }>();
 
@@ -193,12 +196,14 @@ const handleProgramDeleted = (id: number) => {
     displayTotal.value--;
 };
 
-/** 一覧に表示する保存ジョブを取得する */
-const getOfflineDownloadJob = (videoID: number): IOfflineDownloadJob | null => {
-    return props.offlineJobs?.find(job =>
-        job.video_id === videoID && ['Waiting', 'Downloading', 'Finalizing', 'Failed'].includes(job.state),
-    ) ?? null;
-};
+const displayProgramEntries = computed(() => displayPrograms.value.map(program => ({
+    program,
+    // 番組が同じでも、一覧へ行を追加した保存ジョブを操作対象にする。
+    job: props.offlineJobs?.find(job => job.program === program) ?? null,
+    video: props.offlineVideos?.find(video =>
+        video.video_id === program.id && (video.program === program || OfflineVideos.isSameRecording(video.program, program)),
+    ) ?? null,
+})));
 
 </script>
 <style lang="scss" scoped>

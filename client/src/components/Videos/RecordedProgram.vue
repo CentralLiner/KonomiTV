@@ -1,14 +1,18 @@
 <template>
-    <component :is="rootTag" v-ripple class="recorded-program"
-        v-bind="rootBindings"
+    <component :is="hasOfflineJobActions ? 'div' : programTag" v-ripple class="recorded-program"
+        v-bind="hasOfflineJobActions ? {} : programLinkProps"
         :class="{
-            'recorded-program--recording': program.recorded_video.status === 'Recording',
-            'recorded-program--failed': program.recorded_video.status === 'AnalysisFailed',
+            'recorded-program--recording': !hasSavedOfflineVideo && program.recorded_video.status === 'Recording',
+            'recorded-program--failed': !hasSavedOfflineVideo && program.recorded_video.status === 'AnalysisFailed',
             'recorded-program--offline': forOffline,
             'recorded-program--offline-blocked': isOfflineInteractionBlocked,
             'recorded-program--offline-job-failed': isOfflineJobFailed,
         }">
         <div class="recorded-program__container">
+            <!-- 保存済み動画へのリンクを行全体に広げ、操作ボタンをその手前に配置する -->
+            <component :is="programTag" v-if="hasOfflineJobActions && hasSavedOfflineVideo"
+                class="recorded-program__offline-link"
+                v-bind="programLinkProps" :aria-label="program.title" />
             <div class="recorded-program__thumbnail">
                 <img class="recorded-program__thumbnail-image" loading="lazy" decoding="async"
                     :src="offlineThumbnailURL" @error="onOfflineThumbnailError">
@@ -67,8 +71,16 @@
                     </div>
                     <div class="recorded-program__content-meta-time">{{ProgramUtils.getProgramTime(program)}}</div>
                 </div>
-                <div v-if="isOfflineJobFailed && offlineDownloadJob?.error" class="recorded-program__content-error">
-                    {{offlineDownloadJob.error}}
+                <div v-if="isOfflineJobFailed" class="recorded-program__content-error">
+                    <span class="recorded-program__content-error-message">
+                        {{offlineDownloadJob?.error || 'オフライン保存に失敗しました。'}}
+                    </span>
+                    <v-btn v-if="hasOfflineJobActions" icon variant="text" size="x-small" color="secondary"
+                        :loading="isRetryingOfflineJob" :disabled="isRetryingOfflineJob"
+                        aria-label="最初から保存し直す" v-ftooltip="'最初から保存し直す'"
+                        @click.prevent.stop="retryOfflineDownload">
+                        <Icon icon="fluent:arrow-clockwise-16-regular" width="18px" height="18px" />
+                    </v-btn>
                 </div>
                 <div v-else class="recorded-program__content-description"
                     v-html="ProgramUtils.decorateProgramInfo(program, 'description')"></div>
@@ -101,12 +113,11 @@
                 @mousedown.prevent.stop="">
                 <Icon icon="fluent:dismiss-16-regular" width="22px" height="22px" />
             </div>
-            <div v-else-if="forOffline && isOfflineJobFailed" v-ripple class="recorded-program__mylist"
-                role="button" tabindex="0" aria-label="失敗した保存ジョブを閉じる"
-                v-ftooltip="'閉じる'"
-                @click.prevent.stop="dismissOfflineDownload"
-                @keydown.enter.prevent.stop="dismissOfflineDownload"
-                @keydown.space.prevent.stop="dismissOfflineDownload"
+            <div v-if="hasOfflineJobActions" v-ripple class="recorded-program__mylist"
+                role="button" tabindex="0" aria-label="一覧から削除" v-ftooltip="'一覧から削除'"
+                @click.prevent.stop="openDismissOfflineDownload"
+                @keydown.enter.prevent.stop="openDismissOfflineDownload"
+                @keydown.space.prevent.stop="openDismissOfflineDownload"
                 @mousedown.prevent.stop="">
                 <Icon icon="fluent:dismiss-16-regular" width="22px" height="22px" />
             </div>
@@ -197,8 +208,32 @@
     <RecordedFileInfoDialog :program="program" v-model:show="show_video_info" />
     <OfflineVideoDownloadDialog :program="program" v-model:show="showOfflineDownload" />
 
+    <v-dialog v-if="offlineJobToDismiss !== null" v-model="showOfflineJobDismissConfirmation" max-width="420">
+        <v-card>
+            <v-card-title class="d-flex justify-center pt-6 font-weight-bold">
+                失敗した保存を削除しますか？
+            </v-card-title>
+            <v-card-text class="pt-2 pb-0">
+                <div class="mb-2 font-weight-bold"
+                    v-html="ProgramUtils.decorateProgramInfo(offlineJobToDismiss.program, 'title')"></div>
+                この番組の保存済み動画がある場合は、引き続き再生できます。
+            </v-card-text>
+            <v-card-actions class="pt-4 px-6 pb-6">
+                <v-spacer />
+                <v-btn color="text" variant="text" @click="showOfflineJobDismissConfirmation = false">
+                    <Icon icon="fluent:dismiss-16-filled" width="18px" height="18px" />
+                    <span class="ml-1">キャンセル</span>
+                </v-btn>
+                <v-btn color="error" variant="flat" height="40" class="px-3" @click="confirmDismissOfflineDownload">
+                    <Icon icon="fluent:delete-16-regular" width="18px" height="18px" />
+                    <span class="ml-1">一覧から削除</span>
+                </v-btn>
+            </v-card-actions>
+        </v-card>
+    </v-dialog>
+
     <!-- オフライン保存削除確認ダイアログ -->
-    <v-dialog v-model="showOfflineDeleteConfirmation" max-width="715">
+    <v-dialog v-if="offlineVideoToDelete !== null" v-model="showOfflineDeleteConfirmation" max-width="715">
         <v-card>
             <v-card-title class="d-flex justify-center pt-6 font-weight-bold">
                 オフライン保存を削除しますか？
@@ -206,9 +241,9 @@
             <v-card-text class="pt-2 pb-0">
                 <div class="mb-4">
                     <div class="text-h6 text-text mb-2"
-                        v-html="ProgramUtils.decorateProgramInfo(program, 'title')"></div>
+                        v-html="ProgramUtils.decorateProgramInfo(offlineVideoToDelete.program, 'title')"></div>
                     <div class="text-body-2 text-text-darken-1">
-                        {{ProgramUtils.getProgramTime(program)}}
+                        {{ProgramUtils.getProgramTime(offlineVideoToDelete.program)}}
                     </div>
                 </div>
                 <v-alert color="info" variant="tonal">
@@ -263,6 +298,7 @@ import OfflineVideoDownloadDialog from '@/components/Videos/Dialogs/OfflineVideo
 import RecordedFileInfoDialog from '@/components/Videos/Dialogs/RecordedFileInfoDialog.vue';
 import Message from '@/message';
 import OfflineVideos, { type IOfflineDownloadJob, type IOfflineVideo } from '@/services/OfflineVideos';
+import OfflineVideoStorage from '@/services/OfflineVideoStorage';
 import Videos, { type IRecordedProgram } from '@/services/Videos';
 import useSettingsStore from '@/stores/SettingsStore';
 import useUserStore from '@/stores/UserStore';
@@ -276,18 +312,21 @@ const props = withDefaults(defineProps<{
     forOffline?: boolean;
     offlineVideo?: IOfflineVideo | null;
     offlineDownloadJob?: IOfflineDownloadJob | null;
+    isRetryingOfflineJob?: boolean;
 }>(), {
     forMylist: false,
     forWatchedHistory: false,
     forOffline: false,
     offlineVideo: null,
     offlineDownloadJob: null,
+    isRetryingOfflineJob: false,
 });
 
 // Emits
 const emit = defineEmits<{
     (e: 'deleted', id: number): void;
     (e: 'cancelOfflineJob', jobID: string): void;
+    (e: 'retryOfflineJob', jobID: string): void;
     (e: 'dismissOfflineJob', jobID: string): void;
 }>();
 
@@ -297,8 +336,12 @@ const show_video_info = ref(false);
 const show_delete_confirmation = ref(false);
 // オフライン保存ダイアログの表示状態
 const showOfflineDownload = ref(false);
+const showOfflineJobDismissConfirmation = ref(false);
+const offlineJobToDismiss = ref<IOfflineDownloadJob | null>(null);
 // オフライン保存削除確認ダイアログの表示状態
 const showOfflineDeleteConfirmation = ref(false);
+// 削除確認を開いた時点の保存世代を操作対象にする。
+const offlineVideoToDelete = ref<IOfflineVideo | null>(null);
 // オフライン保存の削除中は確定ボタンの二重操作を防ぐ
 const isDeletingOfflineVideo = ref(false);
 
@@ -393,23 +436,32 @@ const isOfflineJobActive = computed(() => {
 
 // 失敗した保存ジョブかどうか
 const isOfflineJobFailed = computed(() => props.offlineDownloadJob?.state === 'Failed');
+// 失敗したオフライン保存に再試行・削除の操作を表示する
+const hasOfflineJobActions = computed(() => props.forOffline && isOfflineJobFailed.value);
+
+// 再保存の状態とは独立に、端末に残っている保存済み動画を再生できる。
+const hasSavedOfflineVideo = computed(() => props.forOffline && props.offlineVideo !== null);
 
 // 保存済みデータがなく、保存ジョブだけが存在する場合は再生リンクを無効化する
 const isOfflineInteractionBlocked = computed(() => {
     if (props.forOffline !== true) return false;
-    if (props.offlineVideo !== null) return false;
+    if (hasSavedOfflineVideo.value) return false;
     return isOfflineJobActive.value === true || isOfflineJobFailed.value === true;
 });
 
-// オフライン保存ページのルート要素 (保存ジョブ実行中は div へ切り替える)
-const rootTag = computed(() => isOfflineInteractionBlocked.value === true ? 'div' : 'router-link');
+const programTag = computed(() => isOfflineInteractionBlocked.value === true ? 'div' : 'router-link');
 
 // router-link 利用時だけ遷移先を渡す
-const rootBindings = computed(() => {
-    if (rootTag.value !== 'router-link') return {};
+const programLinkProps = computed(() => {
+    if (programTag.value !== 'router-link') return {};
+    const path = `/videos/watch/${props.program.id}`;
+    if (props.forOffline && props.offlineVideo !== null) {
+        // 一覧に表示した保存世代を視聴画面へ渡す。
+        return {to: {path, query: {source: 'offline', generation: props.offlineVideo.generation_id}}};
+    }
     return {
         to: props.program.recorded_video.status === 'Recorded'
-            ? (props.forOffline ? `/videos/watch/${props.program.id}?source=offline` : `/videos/watch/${props.program.id}`)
+            ? (props.forOffline ? `${path}?source=offline` : path)
             : { path: '' },
     };
 });
@@ -506,24 +558,40 @@ const cancelOfflineDownload = () => {
     emit('cancelOfflineJob', props.offlineDownloadJob.job_id);
 };
 
-// 失敗した保存ジョブを一覧から消す
-const dismissOfflineDownload = () => {
-    if (props.offlineDownloadJob === null) return;
-    emit('dismissOfflineJob', props.offlineDownloadJob.job_id);
+const retryOfflineDownload = () => {
+    if (props.offlineDownloadJob?.state === 'Failed') {
+        emit('retryOfflineJob', props.offlineDownloadJob.job_id);
+    }
+};
+
+// 確認ダイアログを開いた時点のジョブを操作対象として保持する
+const openDismissOfflineDownload = () => {
+    if (props.offlineDownloadJob?.state !== 'Failed') return;
+    offlineJobToDismiss.value = props.offlineDownloadJob;
+    showOfflineJobDismissConfirmation.value = true;
+};
+
+const confirmDismissOfflineDownload = () => {
+    if (offlineJobToDismiss.value === null) return;
+    const jobID = offlineJobToDismiss.value.job_id;
+    showOfflineJobDismissConfirmation.value = false;
+    emit('dismissOfflineJob', jobID);
 };
 
 // 端末内の保存データだけを削除することを、専用ダイアログで確認
 const deleteOfflineVideo = () => {
-    if (props.offlineVideo === null) return;
+    if (props.offlineVideo === null || isDeletingOfflineVideo.value) return;
+    offlineVideoToDelete.value = props.offlineVideo;
     showOfflineDeleteConfirmation.value = true;
 };
 
 // 確認後にオフライン保存を削除
 const confirmDeleteOfflineVideo = async (): Promise<void> => {
-    if (props.offlineVideo === null || isDeletingOfflineVideo.value === true) return;
+    const video = offlineVideoToDelete.value;
+    if (video === null || isDeletingOfflineVideo.value === true) return;
     isDeletingOfflineVideo.value = true;
     try {
-        await OfflineVideos.deleteVideo(props.program.id);
+        await OfflineVideoStorage.deleteVideo(video);
     } catch (error) {
         Message.error(error instanceof Error ? error.message : 'オフライン保存を削除できませんでした。');
         return;
@@ -531,7 +599,6 @@ const confirmDeleteOfflineVideo = async (): Promise<void> => {
         isDeletingOfflineVideo.value = false;
     }
     showOfflineDeleteConfirmation.value = false;
-    emit('deleted', props.program.id);
     Message.success('オフライン保存を削除しました。');
 };
 
@@ -891,19 +958,32 @@ const deleteVideo = async () => {
         }
 
         &-error {
-            display: -webkit-box;
+            display: flex;
+            align-items: center;
+            gap: 4px;
             margin-top: 6px;
             color: rgb(var(--v-theme-error));
             font-size: 11.5px;
             line-height: 1.55;
-            overflow: hidden;
-            -webkit-line-clamp: 2;
-            -webkit-box-orient: vertical;
+            pointer-events: auto;
             @include smartphone-vertical {
                 margin-top: 2.5px;
                 margin-right: 12px;
                 font-size: 10px;
                 line-height: 1.45;
+            }
+
+            &-message {
+                display: -webkit-box;
+                min-width: 0;
+                overflow: hidden;
+                -webkit-line-clamp: 2;
+                -webkit-box-orient: vertical;
+            }
+
+            .v-btn {
+                flex-shrink: 0;
+                z-index: 2;
             }
         }
     }
@@ -984,6 +1064,13 @@ const deleteVideo = async () => {
             background: rgb(var(--v-theme-secondary-lighten-1));
             transition: width 0.2s ease;
         }
+    }
+
+    &__offline-link {
+        position: absolute;
+        inset: 0;
+        z-index: 1;
+        cursor: pointer;
     }
 
     &__mylist {
@@ -1210,13 +1297,46 @@ const deleteVideo = async () => {
     }
 
     &--offline-job-failed {
+        height: auto;
+        cursor: default;
+
+        .recorded-program__container {
+            height: auto;
+            min-height: 112px;
+        }
+
+        .recorded-program__thumbnail {
+            height: 100px;
+            @include smartphone-horizontal-short {
+                height: 80px;
+            }
+            @include smartphone-vertical {
+                height: auto;
+            }
+        }
+
+        .recorded-program__content {
+            margin-right: 36px;
+        }
+
+        @include smartphone-vertical {
+            .recorded-program__content-meta-time {
+                height: auto;
+            }
+        }
+
+        .recorded-program__mylist,
+        .recorded-program__menu {
+            z-index: 2;
+        }
+
         &:hover {
             background: rgb(var(--v-theme-background-lighten-1));
         }
     }
 
-    // ダウンロード中・失敗時はドロップダウンを出さず、右端ボタンだけ縦中央へ寄せる
-    &--offline-blocked, &--offline-job-failed {
+    // ダウンロード中のキャンセルボタンを縦中央へ寄せる
+    &--offline-blocked {
         .recorded-program__mylist {
             top: 49%;
         }
