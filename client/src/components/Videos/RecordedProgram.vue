@@ -231,11 +231,11 @@
     </v-dialog>
 
     <!-- 録画ファイル削除確認ダイアログ -->
-    <v-dialog max-width="750" v-model="show_delete_confirmation">
+    <v-dialog v-if="recordingToDelete !== null" max-width="750" v-model="show_delete_confirmation">
         <v-card>
             <v-card-title class="d-flex justify-center pt-6 font-weight-bold">本当に録画ファイルを削除しますか？</v-card-title>
             <v-card-text class="pt-2 pb-0">
-                <div class="delete-confirmation__file-path mb-4">{{ program.recorded_video.file_path }}</div>
+                <div class="delete-confirmation__file-path mb-4">{{recordingToDelete.file_path}}</div>
                 <div class="text-error-lighten-1 font-weight-bold">
                     この録画ファイルに関連するすべてのデータ (サムネイル / .ts.program.txt / .ts.err を含む) が削除されます。<br>
                     元に戻すことはできません。本当に録画ファイルを削除しますか？
@@ -295,6 +295,8 @@ const emit = defineEmits<{
 const show_video_info = ref(false);
 // 削除確認ダイアログの表示状態
 const show_delete_confirmation = ref(false);
+// 確認を開いた時点の録画ファイルを操作対象にする。
+const recordingToDelete = ref<{id: number; file_hash: string; file_path: string} | null>(null);
 // オフライン保存ダイアログの表示状態
 const showOfflineDownload = ref(false);
 // オフライン保存削除確認ダイアログの表示状態
@@ -536,25 +538,39 @@ const confirmDeleteOfflineVideo = async (): Promise<void> => {
 };
 
 // 録画ファイル削除確認ダイアログを表示
-const showDeleteConfirmation = () => {
-    const userStore = useUserStore();
-    if (userStore.user === null || userStore.user.is_admin === false) {
+const showDeleteConfirmation = async () => {
+    const recording = {
+        id: props.program.id,
+        file_hash: props.program.recorded_video.file_hash,
+        file_path: props.program.recorded_video.file_path,
+    };
+    // オフライン一覧を直接開いた場合も、サーバー上の原本を操作する時点でログイン情報を取得する。
+    const user = await useUserStore().fetchUser();
+    if (user?.is_admin !== true) {
         Message.warning('録画ファイルを削除するには管理者権限が必要です。\n管理者アカウントでログインし直してください。');
         return;
     }
+    recordingToDelete.value = recording;
     show_delete_confirmation.value = true;
 };
 
 // 録画ファイル削除
 const deleteVideo = async () => {
+    const recording = recordingToDelete.value;
+    if (recording === null || !show_delete_confirmation.value) return;
     show_delete_confirmation.value = false;
+
     Message.info('録画ファイルの削除を開始します。完了までしばらくお待ちください。');
 
-    const result = await Videos.deleteVideo(props.program.id);
+    // オフライン一覧からは、削除するサーバーの録画ファイルを確認済みの情報で指定する。
+    const result = await Videos.deleteVideo(recording.id, props.forOffline ? recording : undefined);
     if (result === true) {
         Message.success('録画ファイルを削除しました。');
-        // 親コンポーネントに削除イベントを発行
-        emit('deleted', props.program.id);
+        // 録画番組一覧で同じファイルを表示している場合に行を取り除き、端末の保存済み動画は一覧に残す。
+        if (!props.forOffline && props.program.id === recording.id &&
+            props.program.recorded_video.file_hash === recording.file_hash && props.program.recorded_video.file_path === recording.file_path) {
+            emit('deleted', recording.id);
+        }
     }
 };
 
