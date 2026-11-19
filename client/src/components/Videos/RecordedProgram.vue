@@ -70,6 +70,10 @@
                 <div v-if="isOfflineJobFailed && offlineDownloadJob?.error" class="recorded-program__content-error">
                     {{offlineDownloadJob.error}}
                 </div>
+                <div v-else-if="isOfflineJobReconnecting && isOfflineJobActive"
+                    class="recorded-program__content-description" role="status">
+                    通信が途切れました。再接続しています。
+                </div>
                 <div v-else class="recorded-program__content-description"
                     v-html="ProgramUtils.decorateProgramInfo(program, 'description')"></div>
             </div>
@@ -188,9 +192,9 @@
                 </v-menu>
             </div>
         </div>
-        <div v-if="displayedOfflineDownloadProgress !== null" class="recorded-program__offline-progress">
+        <div v-if="offlineDownloadProgress !== null" class="recorded-program__offline-progress">
             <div class="recorded-program__offline-progress-bar"
-                :style="`width: ${displayedOfflineDownloadProgress}%`">
+                :style="`width: ${offlineDownloadProgress}%`">
             </div>
         </div>
     </component>
@@ -414,9 +418,15 @@ const rootBindings = computed(() => {
     };
 });
 
+// この保存ジョブが通信の再接続を待っているか
+const isOfflineJobReconnecting = computed(() =>
+    props.offlineDownloadJob !== null && OfflineVideos.isReconnecting(props.offlineDownloadJob.job_id),
+);
+
 // 保存ジョブの状態ラベル
 const offlineDownloadStateLabel = computed(() => {
     if (props.offlineDownloadJob === null) return '';
+    if (isOfflineJobReconnecting.value) return '再接続中';
     return {
         Waiting: '待機中',
         Downloading: 'ダウンロード中',
@@ -482,23 +492,6 @@ const offlineDownloadProgress = computed(() => {
     if (props.offlineDownloadJob.estimated_size_bytes <= 0) return 0;
     return Math.min(99, (props.offlineDownloadJob.downloaded_bytes / props.offlineDownloadJob.estimated_size_bytes) * 100);
 });
-
-// 進捗更新のたびに 0% へ戻ってから伸び直す見え方を避けるため、表示値は単調増加だけを反映する
-const displayedOfflineDownloadProgress = ref<number | null>(null);
-watch(
-    () => [props.offlineDownloadJob?.job_id, offlineDownloadProgress.value] as const,
-    ([jobID, progress]) => {
-        if (progress === null || jobID === undefined) {
-            displayedOfflineDownloadProgress.value = null;
-            return;
-        }
-        const currentProgress = displayedOfflineDownloadProgress.value;
-        if (currentProgress === null || progress >= currentProgress) {
-            displayedOfflineDownloadProgress.value = progress;
-        }
-    },
-    { immediate: true },
-);
 
 // 実行中の保存ジョブをキャンセルする
 const cancelOfflineDownload = () => {
